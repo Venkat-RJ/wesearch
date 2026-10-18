@@ -5,12 +5,12 @@ Usage::
     from wesearch.fetch import ContentParams, RequestParams, RetryParams, fetch
     from wesearch.scrape import get_element_content
 
-    body, _ = fetch(
+    body = fetch(
         "https://example.com", request=RequestParams(retry=RetryParams(timeout_sec=10))
     )
 
     # With cookies:
-    body, _ = fetch(
+    body = fetch(
         "https://example.com",
         request=RequestParams(
             content=ContentParams(cookies={"session": "abc", "lang": "en"})
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 else:
     from wrapt import lazy_import
 
-    bs4 = lazy_import("bs4")  # 140ms.
+    bs4 = lazy_import("bs4")  # 39ms.
 
 
 __all__ = [
@@ -51,4 +51,4 @@ def get_element_content(html: str, selector: str) -> str | None:
     """
     soup = bs4.BeautifulSoup(html, "html.parser")
     element = soup.select_one(selector)
-    return element.get_text(strip=True) if element else None
+    return element.get_text(strip=True) if element is not None else None

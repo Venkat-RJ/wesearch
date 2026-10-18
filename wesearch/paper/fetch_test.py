@@ -15,7 +15,7 @@ from wesearch.types.errors import FetchError
 
 
 if TYPE_CHECKING:
-    from wesearch.lib.custom_json import MutableJSON
+    from treekle import MutablePlainTree
 
 
 _PDF = b"%PDF-1.5" + b"0" * 200
@@ -25,8 +25,49 @@ _HTML = b"<html><body>not a pdf</body></html>"
 """A body that fails ``looks_like_pdf``."""
 
 
-def _fetch_error(status: int) -> FetchError:
-    return FetchError("http://x", status, {}, b"err")
+class _SessionFetch:
+    """A ``fetch`` replaying bodies in order and recording each call's session."""
+
+    def __init__(self, *bodies: bytes) -> None:
+        self._bodies = list(bodies)
+        self.sessions: list[FetchSession | None] = []
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        request: object = None,
+        session: FetchSession | None = None,
+    ) -> bytes:
+        del url, request
+        self.sessions.append(session)
+        return self._bodies.pop(0)
+
+
+class TestSessionForwarding:
+    """Every fetch the PDF cascade makes reuses the caller's session."""
+
+    def test_batch_oa_urls(self) -> None:
+        session = FetchSession()
+        api = _SessionFetch(b"[]")
+        with patch.object(s2, "fetch", api):
+            assert fetch.batch_oa_urls(["DOI:1"], session=session) == []
+        assert [s is session for s in api.sessions] == [True]
+
+    def test_download_through_arxiv_lookup_and_open_access(self) -> None:
+        session = FetchSession()
+        api = _SessionFetch(b'{"openAccessPdf": {"url": "https://oa/pdf"}}')
+        pdfs = _SessionFetch(_HTML, _PDF)
+        with patch.object(s2, "fetch", api), patch.object(fetch, "fetch", pdfs):
+            assert fetch.download("arxiv", "1.2", session=session) == (
+                _PDF,
+                "open_access",
+            )
+        assert [s is session for s in api.sessions + pdfs.sessions] == [
+            True,
+            True,
+            True,
+        ]
 
 
 class TestLooksLikePdf:
@@ -56,21 +97,21 @@ class TestLooksLikePdf:
 
 class TestOaUrlOf:
     def test_present_returns_url(self) -> None:
-        paper: MutableJSON = {"openAccessPdf": {"url": "http://x/pdf"}}
+        paper: dict[str, MutablePlainTree] = {"openAccessPdf": {"url": "http://x/pdf"}}
         assert fetch.oa_url_of(paper) == "http://x/pdf"
 
     def test_missing_returns_none(self) -> None:
-        paper: MutableJSON = {"title": "no oa"}
+        paper: dict[str, MutablePlainTree] = {"title": "no oa"}
         assert fetch.oa_url_of(paper) is None
 
     def test_empty_url_returns_none(self) -> None:
-        paper: MutableJSON = {"openAccessPdf": {"url": ""}}
+        paper: dict[str, MutablePlainTree] = {"openAccessPdf": {"url": ""}}
         assert fetch.oa_url_of(paper) is None
 
 
 class TestBatchOaUrls:
     def test_aligns_urls_and_nones(self) -> None:
-        papers: list[MutableJSON | None] = [
+        papers: list[dict[str, MutablePlainTree] | None] = [
             {"openAccessPdf": {"url": "http://a/pdf"}},
             None,
             {"openAccessPdf": {"url": "http://c/pdf"}},
@@ -79,6 +120,7 @@ class TestBatchOaUrls:
             out = fetch.batch_oa_urls(["DOI:1", "DOI:2", "DOI:3"])
         assert out == ["http://a/pdf", None, "http://c/pdf"]
         assert batch.call_args.args == (["DOI:1", "DOI:2", "DOI:3"], "openAccessPdf")
+        assert batch.call_args.kwargs == {"session": None}
 
     def test_batch_empty_result_is_empty(self) -> None:
         with patch.object(s2, "batch", return_value=[]):
@@ -95,7 +137,7 @@ class TestBatchOaUrls:
 
 class TestDownload:
     def test_arxiv_success(self) -> None:
-        with patch.object(fetch, "fetch", return_value=(_PDF, FetchSession())):
+        with patch.object(fetch, "fetch", return_value=_PDF):
             body, source = fetch.download("arxiv", "1706.03762")
         assert body == _PDF
         assert source == "arxiv"
@@ -103,14 +145,14 @@ class TestDownload:
     def test_arxiv_success_forwards_canonical(self) -> None:
         with patch.object(fetch, "_fetch_arxiv", return_value=_PDF) as arxiv:
             assert fetch.download("arxiv", "1706.03762") == (_PDF, "arxiv")
-        arxiv.assert_called_once_with("1706.03762")
+        arxiv.assert_called_once_with("1706.03762", session=None)
 
     def test_arxiv_fails_then_open_access(self) -> None:
         # arXiv GET returns non-PDF (rejected); the supplied OA URL then wins.
         with patch.object(
             fetch,
             "fetch",
-            side_effect=[(_HTML, FetchSession()), (_PDF, FetchSession())],
+            side_effect=[_HTML, _PDF],
         ):
             body, source = fetch.download(
                 "arxiv",
@@ -129,7 +171,7 @@ class TestDownload:
             patch.object(
                 fetch,
                 "fetch",
-                side_effect=[(_HTML, FetchSession()), (_PDF, FetchSession())],
+                side_effect=[_HTML, _PDF],
             ),
         ):
             body, source = fetch.download("arxiv", "1706.03762")
@@ -141,7 +183,7 @@ class TestDownload:
         s2_get = MagicMock()
         with (
             patch.object(s2, "get", s2_get),
-            patch.object(fetch, "fetch", return_value=(_PDF, FetchSession())),
+            patch.object(fetch, "fetch", return_value=_PDF),
         ):
             body, source = fetch.download(
                 "doi",
@@ -158,7 +200,7 @@ class TestDownload:
         s2_get = MagicMock()
         with (
             patch.object(s2, "get", s2_get),
-            patch.object(fetch, "fetch", side_effect=[(_HTML, FetchSession())]),
+            patch.object(fetch, "fetch", side_effect=[_HTML]),
             pytest.raises(NotFoundError),
         ):
             fetch.download("arxiv", "1706.03762", oa_url=None, oa_looked_up=True)
@@ -166,14 +208,18 @@ class TestDownload:
 
     def test_all_sources_fail_raises_not_found(self) -> None:
         with (
-            patch.object(fetch, "fetch", side_effect=_fetch_error(404)),
+            patch.object(
+                fetch,
+                "fetch",
+                side_effect=FetchError("http://x", 404, {}, b"err"),
+            ),
             pytest.raises(NotFoundError),
         ):
             fetch.download("doi", "10.1/x", oa_url=None, oa_looked_up=True)
 
     def test_doi_kind_skips_arxiv_branch(self) -> None:
         # A doi kind never hits the arXiv PDF base; OA supplies the bytes.
-        fetch_fn = MagicMock(return_value=(_PDF, FetchSession()))
+        fetch_fn = MagicMock(return_value=_PDF)
         with patch.object(fetch, "fetch", fetch_fn):
             body, source = fetch.download(
                 "doi",
@@ -199,13 +245,17 @@ class TestDownload:
         # _s2_oa_lookup swallows any backend error -> no OA URL found.
         with (
             patch.object(s2, "get", side_effect=RuntimeError("down")),
-            patch.object(fetch, "fetch", side_effect=_fetch_error(404)),
+            patch.object(
+                fetch,
+                "fetch",
+                side_effect=FetchError("http://x", 404, {}, b"err"),
+            ),
             pytest.raises(NotFoundError),
         ):
             fetch.download("arxiv", "1706.03762")
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

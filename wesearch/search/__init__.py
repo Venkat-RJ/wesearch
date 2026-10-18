@@ -3,14 +3,16 @@
 The search analogue of :mod:`wesearch.fetch`: one synchronous
 backend-agnostic entry point over SearXNG, DuckDuckGo, and Google.
 
-- :mod:`.custom_types` -- ``SearchResult`` and its per-category subclasses,
-  ``SearchError``, ``SearchBackends``, ``DEFAULT_SEARCH_BACKEND``,
+- :mod:`.types` -- ``SearchResult`` and its per-category subclasses,
+  ``SearchError``, ``SearchBackends``, ``DEFAULT_SEARCH_CHAIN``,
   and ``SearxngCategory``.
+- :mod:`.brave` -- the keyed Brave Search API backend.
 - :mod:`.searxng` -- the SearXNG backend, its per-template parsers, and the
   ``CATEGORIES`` table each tab's gloss and parser live in.
 - :mod:`.duckduckgo` -- the always-available scraped backend.
-- :mod:`.search` -- ``search``, which picks a backend and returns its
-  records, plus the ``SearchParamsSchema`` every surface renders.
+- :mod:`.cache` -- the host-wide result cache.
+- :mod:`.search` -- ``search``, which tries backends in order and returns the
+  first non-empty answer.
 
 This ``__init__`` re-exports the names a caller needs to NAME a result or ask
 for one, so the common import is one line rather than three. It deliberately
@@ -21,8 +23,9 @@ canonical import path per symbol.
 
 from __future__ import annotations
 
-from wesearch.search.custom_types import (
-    DEFAULT_SEARCH_BACKEND,
+from wesearch.search.search import search
+from wesearch.search.types import (
+    DEFAULT_SEARCH_CHAIN,
     CodeResult,
     FileResult,
     ImageResult,
@@ -37,11 +40,10 @@ from wesearch.search.custom_types import (
     TorrentResult,
     VideoResult,
 )
-from wesearch.search.search import search
 
 
 __all__ = [
-    "DEFAULT_SEARCH_BACKEND",
+    "DEFAULT_SEARCH_CHAIN",
     "CodeResult",
     "FileResult",
     "ImageResult",

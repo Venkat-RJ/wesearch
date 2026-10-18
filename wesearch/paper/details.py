@@ -13,19 +13,21 @@ from typing import TYPE_CHECKING, Literal, cast, get_args
 
 import functools
 
-from wesearch.lib.custom_json import MutableJSON, convert
-from wesearch.paper.custom_types import PaperRecord
+from treekle import MutablePlainTree, from_plain
+
 from wesearch.paper.errors import PaperError
 from wesearch.paper.ids import s2_wire_id
 from wesearch.paper.providers import (
     openalex,
     s2,
 )
+from wesearch.paper.types import PaperRecord
 
 
 if TYPE_CHECKING:
-    from wesearch.paper.custom_types import IdType
+    from wesearch.fetch import FetchSession
     from wesearch.paper.paginate import Page
+    from wesearch.paper.types import IdType
 
 
 __all__ = [
@@ -59,39 +61,53 @@ class Listing:
     complete: bool
 
 
-def metadata(kind: IdType, canonical: str) -> PaperRecord:
+def metadata(
+    kind: IdType,
+    canonical: str,
+    *,
+    session: FetchSession | None = None,
+) -> PaperRecord:
     """Fetch single-paper metadata from S2.
 
     Args:
       kind: Identifier type (doi, arxiv, etc.).
       canonical: Bare identifier (e.g., "10.1234/example", "2312.00000").
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       record: PaperRecord with full metadata (title, authors, abstract,
         publication date, citations, PDFs, etc.).
 
-    Returns:
-      result: The PaperRecord.
-
     """
     data = s2.get(
         f"/paper/{s2_wire_id(kind, canonical)}",
         {"fields": s2.S2_PAPER_FIELDS_STR},
+        session=session,
     )
     return s2.paper_record_from(data)
 
 
-def metadata_batch(wire_ids: list[str]) -> list[PaperRecord | None]:
+def metadata_batch(
+    wire_ids: list[str],
+    *,
+    session: FetchSession | None = None,
+) -> list[PaperRecord | None]:
     """Batch-fetch metadata for many wire ids; ``None`` per unresolved id.
 
     Args:
       wire_ids: S2 wire-format paper ids to resolve in one batched request.
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       result: The list[PaperRecord | None].
 
     """
-    records = s2.batch(wire_ids, s2.S2_PAPER_FIELDS_STR, endpoint="paper")
+    records = s2.batch(
+        wire_ids,
+        s2.S2_PAPER_FIELDS_STR,
+        endpoint="paper",
+        session=session,
+    )
     return [s2.paper_record_from(r) if r is not None else None for r in records]
 
 
@@ -101,6 +117,7 @@ def references(
     *,
     limit: int | None,
     source: GraphSource = "s2",
+    session: FetchSession | None = None,
 ) -> Listing:
     """Fetch papers the given paper cites (backward citation edges).
 
@@ -109,6 +126,7 @@ def references(
       canonical: Bare seed identifier.
       limit: Max references, or ``None`` for the backend's default page.
       source: Citation-graph backend (``"s2"`` or ``"openalex"``).
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       listing: A :class:`Listing` of cited papers.
@@ -120,7 +138,12 @@ def references(
     """
     _check_graph_source(source)
     if source == "openalex":
-        records, complete = openalex.references(kind, canonical, limit=limit)
+        records, complete = openalex.references(
+            kind,
+            canonical,
+            limit=limit,
+            session=session,
+        )
         return Listing(records=records, complete=complete)
     fields = ",".join(
         ("isInfluential", *(f"citedPaper.{f}" for f in s2.S2_PAPER_FIELDS)),
@@ -129,6 +152,7 @@ def references(
         f"/paper/{s2_wire_id(kind, canonical)}/references",
         {"fields": fields},
         limit=limit,
+        session=session,
     )
     return _edge_listing(page, inner_key="citedPaper")
 
@@ -141,6 +165,7 @@ def citations(
     source: GraphSource = "s2",
     influential_only: bool = False,
     year_from: int | None = None,
+    session: FetchSession | None = None,
 ) -> Listing:
     """Fetch papers that cite the given paper (forward edges), with filters.
 
@@ -152,6 +177,7 @@ def citations(
       influential_only: S2 only -- restrict to S2's influential subset. OpenAlex
         has no influence flag, so a truthy value under ``"openalex"`` errors.
       year_from: Drop citations published before this year.
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       listing: A :class:`Listing` of citing papers.
@@ -172,6 +198,7 @@ def citations(
             canonical,
             limit=limit,
             year_from=year_from,
+            session=session,
         )
         # The paginator's exhaustion signal alone: OpenAlex's ``meta.count`` is
         # an estimate and can underreport, so ``total <= len(records)`` turned a
@@ -191,24 +218,9 @@ def citations(
         {"fields": fields},
         limit=limit,
         keep=keep,
+        session=session,
     )
     return _edge_listing(page, inner_key="citingPaper")
-
-
-def _edge_listing(page: Page, *, inner_key: str) -> Listing:
-    """Extract paper records from S2 citation-edge entries into a Listing."""
-    records: list[PaperRecord] = []
-    for e in page.entries:
-        inner = cast(MutableJSON, e.get(inner_key) or {})
-        if not inner:
-            continue
-        records.append(
-            s2.paper_record_from(
-                inner,
-                is_influential=cast(bool | None, e.get("isInfluential")),
-            ),
-        )
-    return Listing(records=records, complete=page.complete)
 
 
 # The dispatch below is a single ``if source == "openalex"``, so an unknown value fell
@@ -221,19 +233,37 @@ def _check_graph_source(source: GraphSource) -> None:
         raise PaperError(f"Unknown citation-graph source: {source!r}")
 
 
+def _edge_listing(page: Page, *, inner_key: str) -> Listing:
+    """Extract paper records from S2 citation-edge entries into a Listing."""
+    records: list[PaperRecord] = []
+    for e in page.entries:
+        inner_value = e.get(inner_key)
+        inner = inner_value if isinstance(inner_value, dict) else {}
+        if not inner:
+            continue
+        records.append(
+            s2.paper_record_from(
+                inner,
+                is_influential=cast(bool | None, e.get("isInfluential")),
+            ),
+        )
+    return Listing(records=records, complete=page.complete)
+
+
 def _citation_keep(
-    entry: MutableJSON,
+    entry: dict[str, MutablePlainTree],
     *,
     influential_only: bool,
     year_from: int | None,
 ) -> bool:
     """Whether a citation edge passes the influence and ``year_from`` filters."""
-    if influential_only and not entry.get("isInfluential"):
+    if influential_only and entry.get("isInfluential") is not True:
         return False
     if year_from is None:
         return True
-    inner = cast(MutableJSON, entry.get("citingPaper") or {})
+    inner_value = entry.get("citingPaper")
+    inner = inner_value if isinstance(inner_value, dict) else {}
     raw_year = inner.get("year")
     if raw_year is None or isinstance(raw_year, bool):
         return False
-    return convert(inner.get("year"), int) >= year_from
+    return from_plain(inner.get("year"), int) >= year_from

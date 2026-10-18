@@ -8,8 +8,7 @@ import logging
 
 import pytest
 
-from wesearch.fetch import FetchSession, RequestParams
-from wesearch.search.custom_types import SearchError, SearchResult
+from wesearch.fetch import FetchSession, RequestParams, resolve_transport
 from wesearch.search.duckduckgo import (
     _duckduckgo_check_captcha,
     _duckduckgo_extract_url,
@@ -18,6 +17,7 @@ from wesearch.search.duckduckgo import (
     _duckduckgo_validate_body,
     duckduckgo,
 )
+from wesearch.search.types import SearchError, SearchResult
 from wesearch.types.errors import PuzzleChallengeError
 
 
@@ -193,7 +193,7 @@ def test_duckduckgo_count_boundaries_and_query_limit() -> None:
         duckduckgo("abcd", max_query_chars=3)
     with patch(
         "wesearch.search.duckduckgo.fetch",
-        return_value=(b'<div id="links"></div>', FetchSession()),
+        return_value=b'<div id="links"></div>',
     ):
         duckduckgo("abc", max_query_chars=3)
         duckduckgo("x" * 499)
@@ -212,7 +212,7 @@ def test_duckduckgo_default_result_limit_is_ten() -> None:
     )
     with patch(
         "wesearch.search.duckduckgo.fetch",
-        return_value=(html.encode(), FetchSession()),
+        return_value=html.encode(),
     ):
         assert len(duckduckgo("q")) == 10
 
@@ -220,27 +220,46 @@ def test_duckduckgo_default_result_limit_is_ten() -> None:
 def test_duckduckgo_request_forwards_override_headers() -> None:
     with patch(
         "wesearch.search.duckduckgo.fetch",
-        return_value=(b'<div id="links"></div>', FetchSession()),
+        return_value=b'<div id="links"></div>',
     ) as fetch_mock:
         duckduckgo("q", headers={"User-Agent": "custom"})
     request = fetch_mock.call_args.kwargs["request"]
     assert isinstance(request, RequestParams)
-    assert request.content.headers is not None
     assert request.content.headers == {
-        "User-Agent": "custom",
-        "Accept": "*/*",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Accept-Language": "all,all-ALL;q=0.7",
         "Referer": "https://html.duckduckgo.com/html/",
+        "User-Agent": "custom",
     }
-    assert request.content.raw_headers is True
     assert request.policy.transport == "auto"
-    assert request.retry.retries == 2
-    assert request.retry.timeout_sec == 30.0
+    assert request.retry.retries == 1
+    assert request.retry.timeout_sec == 10.0
     assert request.retry.connect_timeout_sec == 3.0
+
+
+def test_duckduckgo_session_reaches_fetch() -> None:
+    session = FetchSession()
+    with patch(
+        "wesearch.search.duckduckgo.fetch",
+        return_value=b'<div id="links"></div>',
+    ) as fetch_mock:
+        duckduckgo("q", session=session)
+    assert fetch_mock.call_args.kwargs["session"] is session
+
+
+def test_duckduckgo_request_can_escalate_to_the_browser() -> None:
+    """DDG must ride the identity layer, which is what reaches Chrome on a block.
+
+    ``raw_headers`` resolved the request to bare curl and the browser leg
+    refuses it, so a DDG challenge had no fallback at all.
+    """
+    with patch(
+        "wesearch.search.duckduckgo.fetch",
+        return_value=b'<div id="links"></div>',
+    ) as fetch_mock:
+        duckduckgo("q")
+    request = fetch_mock.call_args.kwargs["request"]
+    assert isinstance(request, RequestParams)
+    assert request.content.raw_headers is False
+    assert resolve_transport(request.policy.transport) == "curl-then-zendriver"
 
 
 def test_duckduckgo_parse_preserves_missing_snippet_and_logs_challenge(
@@ -266,10 +285,7 @@ def test_duckduckgo_parse_preserves_missing_snippet_and_logs_challenge(
 def test_duckduckgo_public_request_and_validation() -> None:
     with patch(
         "wesearch.search.duckduckgo.fetch",
-        return_value=(
-            b'<div id="links"><div class="web-result"><h2><a href="https://x">x</a></h2></div></div>',
-            FetchSession(),
-        ),
+        return_value=b'<div id="links"><div class="web-result"><h2><a href="https://x">x</a></h2></div></div>',
     ) as fetch_mock:
         assert duckduckgo(
             "!w x",
@@ -292,6 +308,6 @@ def test_duckduckgo_public_request_and_validation() -> None:
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

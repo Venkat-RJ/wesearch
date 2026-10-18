@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import fields
 
-from wesearch.paper.custom_types import PaperRecord
 from wesearch.paper.fuse import _find, fuse, normalize_title
+from wesearch.paper.types import PaperRecord
 
 
-def _rec(title: str, *, doi: str | None = None, source: str = "s2") -> PaperRecord:
+def _rec(title: str, *, doi: str = "", source: str = "s2") -> PaperRecord:
     return PaperRecord(title=title, doi=doi, sources=(source,))
 
 
@@ -210,6 +210,6 @@ class TestAMissingTitleIsNotIdentity:
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

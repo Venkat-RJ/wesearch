@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 
 import time
 
-from wesearch.paper.custom_types import PaperRecord
 from wesearch.paper.errors import PaperError
 from wesearch.paper.search import SearchResult
+from wesearch.paper.types import PaperRecord
 from wesearch.scripts import measure_fusion_quality
 
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     import pytest
 
 
-def _record(title: str, *, doi: str = "", arxiv_id: str | None = None) -> PaperRecord:
+def _record(title: str, *, doi: str = "", arxiv_id: str = "") -> PaperRecord:
     return PaperRecord(title=title, doi=doi, arxiv_id=arxiv_id)
 
 
@@ -189,6 +189,6 @@ def test_main_default_limit_is_forty(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

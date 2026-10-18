@@ -20,7 +20,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from wesearch.lib.custom_json import MutableJSON
+from treekle import MutablePlainTree
+
 from wesearch.paper.errors import BackendError
 
 
@@ -29,11 +30,6 @@ __all__ = [
     "Page",
     "paginate",
 ]
-
-
-def _keep_all(entry: MutableJSON) -> bool:
-    del entry
-    return True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -48,7 +44,7 @@ class Page:
 
     """
 
-    entries: list[MutableJSON]
+    entries: list[dict[str, MutablePlainTree]]
     complete: bool
 
 
@@ -77,19 +73,24 @@ class Cursor:
 
     """
 
-    fetch: Callable[[int, int], MutableJSON]
-    rows: Callable[[MutableJSON], list[MutableJSON]]
-    advance: Callable[[MutableJSON, int, int], int | None]
+    fetch: Callable[[int, int], dict[str, MutablePlainTree]]
+    rows: Callable[[dict[str, MutablePlainTree]], list[dict[str, MutablePlainTree]]]
+    advance: Callable[[dict[str, MutablePlainTree], int, int], int | None]
     page_size_max: int
     start: int = 0
     is_depth_ceiling: Callable[[BackendError], bool] = field(default=lambda _e: False)
+
+
+def _keep_all(entry: dict[str, MutablePlainTree]) -> bool:
+    del entry
+    return True
 
 
 def paginate(
     cursor: Cursor,
     *,
     limit: int | None,
-    keep: Callable[[MutableJSON], bool] = _keep_all,
+    keep: Callable[[dict[str, MutablePlainTree]], bool] = _keep_all,
 ) -> Page:
     """Walk ``cursor`` collecting rows ``keep`` accepts, up to ``limit``.
 
@@ -114,7 +115,7 @@ def paginate(
     if limit is not None and limit < 0:
         raise ValueError(f"'limit' must be >= 0 or None, got {limit}.")
     page_size = _page_size(limit, cursor.page_size_max)
-    kept: list[MutableJSON] = []
+    kept: list[dict[str, MutablePlainTree]] = []
     position = cursor.start
     while True:
         try:
@@ -143,6 +144,9 @@ def _page_size(limit: int | None, page_size_max: int) -> int:
     return min(limit, page_size_max)
 
 
-def _cap(entries: list[MutableJSON], limit: int | None) -> list[MutableJSON]:
+def _cap(
+    entries: list[dict[str, MutablePlainTree]],
+    limit: int | None,
+) -> list[dict[str, MutablePlainTree]]:
     """Trim ``entries`` to ``limit`` (no-op when ``limit`` is ``None``)."""
     return entries if limit is None else entries[:limit]

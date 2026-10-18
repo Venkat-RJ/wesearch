@@ -3,7 +3,7 @@
 
 [project]
 name = "wesearch"
-version = "0.1.12"
+version = "0.1.13"
 description = "Web search, fetch, and paper-research toolkit."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -23,6 +23,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
+    # Prefer https://awesome-python.com deps over alternatives.
+    "treekle>=0.2.0",
     # web client / scraping
     "beautifulsoup4",
     "curl-cffi>=0.15.0",
@@ -32,7 +34,6 @@ dependencies = [
     "trafilatura",
     "zendriver>=0.15.5",
     # serialization
-    "msgspec>=0.22.0",
     # containers
     "wrapt",
     # compression (Content-Encoding decode)
@@ -50,6 +51,7 @@ mcp = ["mcp>=2.0.0"]
 
 debug = [
     "ipython",
+    "tqdm",
 ]
 lint = [
     "codespell>=2.2.4",
@@ -70,7 +72,7 @@ typecheck = [
     "basedpyright>=1.40.1",
     "ty>=0.0.84",
     "rekursiv-ai-typeshed",
-    "hatchling>=1.32.4",  # packages/rekursiv-ai-typeshed/rekursiv_ai_typeshed/hatch_build.py subscripts its one-parameter BuildHookInterface.
+    "rekursiv-ai-typings",
 ]
 "pre-commit" = [
     "pre-commit>=4.6",
@@ -88,7 +90,7 @@ dev = [
 
 [project.scripts]
 wesearch-mcp = "wesearch.mcp.server:main"
-fetch-zendriver = "wesearch.fetch.transport.zendriver:main"
+zendriver = "wesearch.fetch.transport.zendriver:main"
 
 [project.urls]
 Homepage = "https://www.rekursiv.ai"
@@ -164,6 +166,7 @@ markers = [
     "gpu_triton: requires Triton kernels",
     "network_anthropic: reaches Anthropic over the network",
     "network_duckduckgo: reaches DuckDuckGo over the network",
+    "network_e2b: reaches E2B over the network",
     "network_gemini: reaches Gemini over the network",
     "network_google_search: reaches Google Search over the network",
     "network_github: reaches GitHub over the network",
@@ -175,12 +178,12 @@ markers = [
     "network_openreview: reaches OpenReview over the network",
     "network_pypi: reaches PyPI over the network",
     "network_searxng: reaches a SearXNG service over the network",
-    "network_shadeform: reaches Shadeform over the network",
+    "network_gpu_cloud: reaches a GPU cloud provider over the network",
     "network_slack: reaches Slack over the network",
     "network_together: reaches Together over the network",
     "network_wandb: reaches Weights & Biases over the network",
 ]
-addopts = "-m 'not ci_smoke and not cuda and not integration and not performance and not cluster and not slow' --durations=20 --dist=worksteal"
+addopts = "-m 'not ci_smoke and not cuda and not integration and not performance and not cluster and not slow' --durations=20 --dist=worksteal -p no:py_pglite"
 timeout = 60
 # "error" = treat all warnings as errors (same as -Werror).
 # Using filterwarnings instead of addopts so we can add exceptions.
@@ -221,13 +224,20 @@ do_not_mutate_patterns = [
 ]
 
 [tool.coverage.run]
+# sys.monitoring, the default from Python 3.14 on. 3.12's default, ctrace,
+# traces every line a test runs, Numba's pure-Python compiler included: a cold
+# compile of priml's Craftax kernels took 68 s under it, 49 s under sysmon and
+# 43 s untraced, past the 60 s test timeout. COVERAGE_CORE still overrides it,
+# as the testmon hooks' ctrace does.
+core = "sysmon"
 omit = [
     "*_test.py",
     "test_*.py",
     "*/tests/*",
     "*/.venv/*",
     "*/typings/*",
-    "*/tools/*",
+    "*/testdata/*",
+    "*/__main__.py",
 ]
 
 [tool.coverage.report]
@@ -236,13 +246,19 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "if __name__ == .__main__.:",
     "raise NotImplementedError",
+    "^\\s*\\.\\.\\.$",
     # Convention: a ``_triton``-suffixed def is a body ``triton.jit`` compiles
     # from its source text to PTX. The Python bytecode never runs, so the
     # tracer cannot see lines a GPU test executed; the kernel is tested by
     # its ``gpu_triton`` caller, not by line coverage.
     "^def \\w+_triton\\(",
+    # Convention: a ``_numba``-suffixed def is a body Numba compiles from
+    # its bytecode to machine code. The Python bytecode never runs, so the
+    # tracer cannot see lines a test executed; the kernel is tested by its
+    # callers' results, not by line coverage.
+    "^def \\w+_numba\\(",
 ]
-# fail_under = 90
+fail_under = 100
 show_missing = true
 skip_covered = true
 
@@ -270,11 +286,14 @@ select = ["ALL"]
 
 extend-safe-fixes = [
     "C4",     # Collection and comprehension rewrites.
+    "D301",   # Use `r"""` if any backslashes in a docstring.
     "E711",   # Compare to None with identity.
     "E712",   # Compare booleans by truthiness.
+    "E731",   # Do not assign a `lambda` expression, use a `def`.
     "F401",   # Remove unused imports.
     "F601",   # Remove overwritten dictionary entries.
     "F841",   # Remove unused local bindings.
+    "ISC004", # Unparenthesized implicit string concatenation in collection.
     "PT006",  # Use tuple for pytest.mark.parametrize names.
     "PT007",  # Use tuple/list consistently for pytest values.
     "PT018",  # Split composite assertions.
@@ -460,7 +479,7 @@ ignore = [
 # runtime-evaluated-*: never move an import USED IN annotations of these.
 #   - pydantic.BaseModel: validates fields from annotations.
 #   - configgle Fig/Makes/Maker: resolves Config fields and owner __init__ hints.
-#   - dataclasses.dataclass: custom_json.to_json, cli_override, and
+#   - dataclasses.dataclass: codec.from_plain, cli_override, and
 #     tool_spec.coerce_kwargs call get_type_hints on any dataclass. This pins
 #     every dataclass field type eager; a heavy one (torch.Tensor) that the
 #     house `annotation-import` rule then flags takes an inline house-ignore.
@@ -528,12 +547,12 @@ useLibraryCodeForTypes = false
 # `stubPath` (not `extraPaths`) is the one root that resolves ahead of an
 # installed package's inline types.
 stubPath = "typings"
-# typings/ is ALSO a source root so a stub package can ship a placeholder .py:
-# triton is linux-only (uv.lock `sys_platform == 'linux'`), so without this
-# every `import triton` fails `reportMissingModuleSource` on macOS, and an inline
-# suppression would fail `reportUnnecessaryTypeIgnoreComment` on linux. Stubs
-# still win over source, so no type changes. Mirrors [tool.ty.environment].
-extraPaths = ["typings"]
+# typings/ is ALSO a source root so a local stub can ship a placeholder .py.
+# `rekursiv-ai-typings` installs its own placeholder trees (triton is
+# linux-only, so without one every `import triton` fails
+# `reportMissingModuleSource` on macOS) under .venv/share. Stubs still win
+# over source, so no type changes.
+extraPaths = ["typings", ".venv/share/rekursiv-ai-typings"]
 # `rekursiv-ai-typeshed` (a `typecheck` dependency): the checkers' bundled stdlib
 # with `int`/`float` `__pow__` returning `float` rather than typeshed's `Any`,
 # which would otherwise make every `x ** 0.5` a `reportAny` violation.
@@ -637,6 +656,9 @@ skip = "htmlcov,.doctrees,*.pyc,*.ico,*.png,*.jpg,*.PNG,*.inv,*.dot,*.css,*.egg-
 ignore-regex = '(?:https?://[^\s)>\]]+|`[^`\n]+`|\b\w*[a-z][A-Z]\w*\b)'
 ignore-multiline-regex = '(?m)^[ \t]*```.*?^[ \t]*```'
 
+[tool.jupytext]
+formats = "ipynb,py:percent"
+
 [tool.uv]
 package = true
 environments = [
@@ -662,4 +684,6 @@ rekursiv-ai-typeshed = [
 compile-bytecode = true
 
 [tool.uv.sources]
-rekursiv-ai-typeshed = { path = "packages/rekursiv-ai-typeshed" }
+treekle = { git = "https://github.com/rekursiv-ai/treekle", branch = "main" }
+rekursiv-ai-typeshed = { git = "https://github.com/rekursiv-ai/typings", subdirectory = "typeshed", branch = "main" }
+rekursiv-ai-typings = { git = "https://github.com/rekursiv-ai/typings", branch = "main" }

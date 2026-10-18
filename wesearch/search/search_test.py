@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, ClassVar, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,7 +17,20 @@ import pytest
 
 from wesearch.fetch import FetchSession, RequestParams
 from wesearch.fetch.transport.zendriver import BrowserUnavailableError
-from wesearch.search.custom_types import (
+from wesearch.mcp.schema import literal_values
+from wesearch.mcp.types import SearchParamsSchema
+from wesearch.search.duckduckgo import (
+    _duckduckgo_check_captcha,
+    _duckduckgo_extract_url,
+    _duckduckgo_parse,
+    _duckduckgo_quote_bangs,
+    _duckduckgo_validate_body,
+    duckduckgo,
+)
+from wesearch.search.search import search
+from wesearch.search.searxng import _searxng_url, category_gloss, searxng
+from wesearch.search.types import (
+    DEFAULT_SEARCH_CHAIN,
     CodeResult,
     FileResult,
     ImageResult,
@@ -29,25 +42,13 @@ from wesearch.search.custom_types import (
     SearxngCategory,
     TorrentResult,
     VideoResult,
-    gsa_headers_for_query,
     strip_scripts,
 )
-from wesearch.search.duckduckgo import (
-    _duckduckgo_check_captcha,
-    _duckduckgo_extract_url,
-    _duckduckgo_parse,
-    _duckduckgo_quote_bangs,
-    _duckduckgo_validate_body,
-    duckduckgo,
-)
-from wesearch.search.search import SearchParamsSchema, search
-from wesearch.search.searxng import _searxng_url, category_gloss, searxng
 from wesearch.types.errors import (
     BotDetectionError,
     FetchError,
     PuzzleChallengeError,
 )
-from wesearch.types.schema import literal_values
 
 
 if TYPE_CHECKING:
@@ -60,26 +61,13 @@ def _patch_fetch(
     *,
     module: str = "search",
 ) -> AbstractContextManager[MagicMock | AsyncMock]:
-    # Fetch returns (body, session); wrap the byte-valued test inputs so the
-    # mock matches that shape (an exception side_effect still raises).
     # Two direct calls rather than one `**kwargs` splat: the branches set
     # mutually exclusive keys, and splatting an untyped mapping into `patch`'s
     # overload set erases what it returns.
     target = f"wesearch.search.{module}.fetch"
     if side_effect is not None:
-        return patch(target, side_effect=_tuple_side_effect(side_effect))
-    return patch(target, return_value=(return_value, FetchSession()))
-
-
-def _tuple_side_effect(side_effect: object) -> object:
-    """Wrap a byte-valued side_effect so each byte result becomes (bytes, session)."""
-    if isinstance(side_effect, list):
-        items = cast(list[object], side_effect)
-        return [
-            item if isinstance(item, BaseException) else (item, FetchSession())
-            for item in items
-        ]
-    return side_effect  # An exception class/instance: raised as-is.
+        return patch(target, side_effect=side_effect)
+    return patch(target, return_value=return_value)
 
 
 @contextmanager
@@ -157,8 +145,8 @@ class TestSearchDispatch:
             "wesearch.search.search.duckduckgo",
             return_value=[],
         ) as provider:
-            search("cats", backend="duckduckgo", transport="stdlib")
-        assert provider.call_args.kwargs["transport"] == "stdlib"
+            search("cats", backend="duckduckgo", transport="zendriver")
+        assert provider.call_args.kwargs["transport"] == "zendriver"
 
     def test_negative_num_results_rejected_duckduckgo(self) -> None:
         # O-WEB-003: negative num_results was accepted inconsistently (ddg had no
@@ -172,16 +160,6 @@ class TestSearchDispatch:
             pytest.raises(ValueError, match="num_results"),
         ):
             search("cats", backend="searxng", num_results=-1)
-
-
-class TestGsaHeaders:
-    def test_query_selects_stable_user_agent(self) -> None:
-        with patch(
-            "wesearch.search.custom_types.user_agent_pool",
-            return_value=("ua0", "ua1", "ua2"),
-        ):
-            assert gsa_headers_for_query("same") == gsa_headers_for_query("same")
-            assert gsa_headers_for_query("same")["User-Agent"].endswith(" NSTNWV")
 
 
 class TestSearchSearxng:
@@ -954,16 +932,10 @@ class TestSearchDuckduckgo:
         assert results[0].title == "Example Title"
 
     def test_uses_normal_browser_request_contract(self) -> None:
-        with (
-            patch(
-                "wesearch.search.duckduckgo.user_agent_pool",
-                return_value=("ddg-test-ua",),
-            ),
-            _patch_fetch(
-                module="duckduckgo",
-                return_value=_NO_RESULTS_DDG.encode(),
-            ) as mock,
-        ):
+        with _patch_fetch(
+            module="duckduckgo",
+            return_value=_NO_RESULTS_DDG.encode(),
+        ) as mock:
             duckduckgo("test")
         # The query rides in the URL, not a POST body: a POSTed query is dropped
         # and DDG serves its empty homepage. GET with q= returns real results.
@@ -974,40 +946,13 @@ class TestSearchDuckduckgo:
         assert url.startswith("https://html.duckduckgo.com/html/?")
         assert "q=test" in url
         assert "kl=wt-wt" in url
-        assert req.content.headers == {
-            "User-Agent": "ddg-test-ua NSTNWV",
-            "Accept": "*/*",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
-            "Accept-Language": "all,all-ALL;q=0.7",
-            "Referer": "https://html.duckduckgo.com/html/",
-        }
+        # Only the Referer: the identity layer supplies a UA coherent with the
+        # TLS fingerprint and keeps it stable per (egress, domain), which is the
+        # stability DDG's vqd token needs.
+        assert req.content.headers == {"Referer": "https://html.duckduckgo.com/html/"}
         assert not req.content.cookies
-        # INF-025: the GSA mobile UA must be sent verbatim, without fetch's
-        # default desktop Chrome sec-ch-ua headers.
-        assert req.content.raw_headers is True
-        assert req.retry.retries == 2
-
-    def test_user_agent_is_process_stable_across_queries(self) -> None:
-        # DDG's vqd anti-bot token is keyed to (query, UA); a UA that shifts
-        # between requests is read as a bot. Unlike the per-query Google UA, the
-        # DDG UA must be the SAME for every query in the process.
-        with _patch_fetch(
-            module="duckduckgo",
-            return_value=_NO_RESULTS_DDG.encode(),
-        ) as mock:
-            duckduckgo("alpha")
-            duckduckgo("beta")
-        headers_a = _request(mock, 0).content.headers
-        headers_b = _request(mock, 1).content.headers
-        assert headers_a is not None
-        assert headers_b is not None
-        ua_a = headers_a["User-Agent"]
-        ua_b = headers_b["User-Agent"]
-        assert ua_a == ua_b
-        assert ua_a.endswith("NSTNWV")
+        assert req.content.raw_headers is False
+        assert req.retry.retries == 1
 
     def test_quotes_bangs_before_request(self) -> None:
         with _patch_fetch(
@@ -1100,28 +1045,28 @@ class TestLiveQueryAvailabilitySkips:
 
 class TestSearchDispatchDefaults:
     def test_general_without_backend_uses_default_provider(self) -> None:
-        # Public builds default to duckduckgo; pin the default so neither build
-        # reaches the network.
         with (
-            patch("wesearch.search.search.DEFAULT_SEARCH_BACKEND", "searxng"),
+            patch("wesearch.search.search.DEFAULT_SEARCH_CHAIN", ("searxng",)),
             patch("wesearch.search.search.searxng", return_value=[]) as provider,
         ):
             assert (
-                search("q", num_results=3, headers={"X": "y"}, transport="stdlib") == []
+                search("q", num_results=3, headers={"X": "y"}, transport="zendriver")
+                == []
             )
         provider.assert_called_once_with(
             "q",
             3,
             {"X": "y"},
             categories="general",
-            transport="stdlib",
+            transport="zendriver",
+            session=None,
         )
 
     def test_non_general_without_backend_forces_searxng(self) -> None:
         with (
             patch(
-                "wesearch.search.search.DEFAULT_SEARCH_BACKEND",
-                "duckduckgo",
+                "wesearch.search.search.DEFAULT_SEARCH_CHAIN",
+                ("duckduckgo",),
             ),
             patch("wesearch.search.search.searxng", return_value=[]) as provider,
         ):
@@ -1132,6 +1077,7 @@ class TestSearchDispatchDefaults:
             None,
             categories="science",
             transport="auto",
+            session=None,
         )
 
     def test_duckduckgo_dispatch_forwards_headers(self) -> None:
@@ -1145,22 +1091,160 @@ class TestSearchDispatchDefaults:
             10,
             {"X": "y"},
             transport="auto",
+            session=None,
         )
 
     def test_general_without_backend_uses_build_default_exactly(self) -> None:
         with (
-            patch("wesearch.search.search.DEFAULT_SEARCH_BACKEND", "duckduckgo"),
+            patch(
+                "wesearch.search.search.DEFAULT_SEARCH_CHAIN",
+                ("duckduckgo",),
+            ),
             patch(
                 "wesearch.search.search.duckduckgo",
                 return_value=[],
             ) as provider,
         ):
             assert search("q") == []
-        provider.assert_called_once_with("q", 10, None, transport="auto")
+        provider.assert_called_once_with(
+            "q",
+            10,
+            None,
+            transport="auto",
+            session=None,
+        )
+
+
+_HIT = SearchResult(url="https://hit.example/", title="hit", snippet="")
+
+
+class TestSearchFallbackChain:
+    """An unnamed backend walks the chain; one failure never fails the search."""
+
+    def _chain(
+        self,
+        **outcomes: object,
+    ) -> tuple[AbstractContextManager[object], list[str]]:
+        """Patch every backend to record its call and return or raise its outcome."""
+        reached: list[str] = []
+
+        def runner(name: str) -> Callable[..., object]:
+            def run(*_args: object, **_kwargs: object) -> object:
+                reached.append(name)
+                outcome = outcomes[name]
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            return run
+
+        @contextmanager
+        def patched() -> Generator[object]:
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch(
+                        "wesearch.search.search.DEFAULT_SEARCH_CHAIN",
+                        tuple(outcomes),
+                    ),
+                )
+                for name in outcomes:
+                    stack.enter_context(
+                        patch(f"wesearch.search.search.{name}", runner(name)),
+                    )
+                yield None
+
+        return patched(), reached
+
+    def test_the_default_chain_tries_the_paid_backend_last(self) -> None:
+        assert DEFAULT_SEARCH_CHAIN == ("duckduckgo", "searxng", "brave")
+
+    def test_a_failing_backend_hands_over_to_the_next(self) -> None:
+        context, reached = self._chain(
+            brave=SearchError("BRAVE_API_KEY must be set"),
+            searxng=FetchError("https://searx", 503, {}, b""),
+            duckduckgo=[_HIT],
+        )
+        with context:
+            assert search("q") == [_HIT]
+        assert reached == ["brave", "searxng", "duckduckgo"]
+
+    def test_a_bot_block_inside_the_chain_moves_on(self) -> None:
+        context, reached = self._chain(
+            duckduckgo=PuzzleChallengeError("challenge"),
+            searxng=[_HIT],
+        )
+        with context:
+            assert search("q") == [_HIT]
+        assert reached == ["duckduckgo", "searxng"]
+
+    def test_an_empty_answer_tries_the_next_backend(self) -> None:
+        context, reached = self._chain(searxng=[], duckduckgo=[_HIT])
+        with context:
+            assert search("q") == [_HIT]
+        assert reached == ["searxng", "duckduckgo"]
+
+    def test_the_chain_stops_at_the_first_answer(self) -> None:
+        context, reached = self._chain(searxng=[_HIT], duckduckgo=[_HIT])
+        with context:
+            search("q")
+        assert reached == ["searxng"]
+
+    def test_every_failure_is_named_when_the_whole_chain_fails(self) -> None:
+        context, _ = self._chain(
+            searxng=FetchError("https://searx", 503, {}, b""),
+            duckduckgo=PuzzleChallengeError("challenge"),
+        )
+        with context, pytest.raises(SearchError) as raised:
+            search("q")
+        assert "every search backend failed" in str(raised.value)
+        assert "searxng:" in str(raised.value)
+        assert "duckduckgo:" in str(raised.value)
+
+    def test_a_cached_answer_skips_the_backend(self) -> None:
+        context, reached = self._chain(duckduckgo=[_HIT])
+        with context:
+            assert search("q") == [_HIT]
+            assert search("q") == [_HIT]
+        assert reached == ["duckduckgo"]
 
     def test_unknown_backend_message_is_exact(self) -> None:
         with pytest.raises(ValueError, match=r"^Unknown backend: 'bogus'$"):
             search("q", backend=cast(SearchBackends, "".join(("bogus",))))
+
+
+class TestSessionArg:
+    @pytest.mark.parametrize("backend", DEFAULT_SEARCH_CHAIN)
+    def test_the_session_reaches_every_backend_fetch(
+        self,
+        backend: SearchBackends,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.test/")
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        session = FetchSession()
+        body = b"{}" if backend in ("brave", "searxng") else b"<p>empty</p>"
+        with _patch_fetch(module=backend, return_value=body) as mock:
+            search("q", backend=backend, session=session, cache_ttl_sec=0)
+        assert mock.call_args.kwargs["session"] is session
+
+    def test_the_chain_passes_one_session_to_each_backend(self) -> None:
+        session = FetchSession()
+        seen: dict[str, object] = {}
+
+        def runner(name: str) -> Callable[..., list[SearchResult]]:
+            def run(*_args: object, **kwargs: object) -> list[SearchResult]:
+                seen[name] = kwargs["session"]
+                return []
+
+            return run
+
+        with ExitStack() as stack:
+            for name in DEFAULT_SEARCH_CHAIN:
+                stack.enter_context(
+                    patch(f"wesearch.search.search.{name}", runner(name)),
+                )
+            search("q", session=session, cache_ttl_sec=0)
+        assert seen == dict.fromkeys(DEFAULT_SEARCH_CHAIN, session)
 
 
 class TestHeadersArg:
@@ -1178,14 +1262,8 @@ class TestHeadersArg:
         ) as mock:
             duckduckgo("q", headers={"User-Agent": "x"})
         assert _request(mock).content.headers == {
-            "User-Agent": "x",
-            "Accept": "*/*",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
-            "Accept-Language": "all,all-ALL;q=0.7",
             "Referer": "https://html.duckduckgo.com/html/",
+            "User-Agent": "x",
         }
 
 
@@ -1204,6 +1282,6 @@ def _recorded_url(mock: MagicMock | AsyncMock, index: int = -1) -> str:
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

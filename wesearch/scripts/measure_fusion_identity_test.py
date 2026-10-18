@@ -8,14 +8,14 @@ import time
 
 import pytest
 
-from wesearch.paper.custom_types import PaperRecord
 from wesearch.paper.errors import PaperError
 from wesearch.paper.providers import openalex, s2
 from wesearch.paper.search import SearchResult
+from wesearch.paper.types import PaperRecord
 from wesearch.scripts import measure_fusion_identity
 
 
-def _record(*, doi: str = "", arxiv_id: str | None = None) -> PaperRecord:
+def _record(*, doi: str = "", arxiv_id: str = "") -> PaperRecord:
     return PaperRecord(title="Title", doi=doi, arxiv_id=arxiv_id)
 
 
@@ -90,6 +90,13 @@ def test_raw_mag_probes_skip_wrong_typed_rows() -> None:
     oa_body = {"results": oa_rows}
     with patch.object(openalex, "_get", return_value=oa_body):
         assert measure_fusion_identity._raw_mag_openalex("query") == {"9": ""}
+
+
+def test_raw_mag_probes_treat_non_array_payloads_as_empty() -> None:
+    with patch.object(s2, "get", return_value={"data": {"MAG": "m"}}):
+        assert measure_fusion_identity._raw_mag_s2("query") == {}
+    with patch.object(openalex, "_get", return_value={"results": "oops"}):
+        assert measure_fusion_identity._raw_mag_openalex("query") == {}
 
 
 def test_raw_mag_s2_retries_paper_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -383,6 +390,6 @@ def test_main_returns_one_when_no_samples(
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

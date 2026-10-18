@@ -5,21 +5,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from wesearch.fetch import FetchSession
 from wesearch.paper.authors import author_metadata, author_papers, search_authors
-from wesearch.paper.custom_types import AuthorRecord
 from wesearch.paper.paginate import Page
 from wesearch.paper.providers import s2
+from wesearch.paper.types import AuthorRecord
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from wesearch.lib.custom_json import MutableJSON
+    from treekle import MutablePlainTree
 
 
 class TestAuthors:
     def test_search_sorts_by_h_index_and_caps(self) -> None:
-        payload: MutableJSON = {
+        payload: dict[str, MutablePlainTree] = {
             "total": 3,
             "data": [
                 {"authorId": "1", "name": "Low", "hIndex": 5},
@@ -45,10 +46,10 @@ class TestAuthors:
         assert isinstance(recs[0], AuthorRecord)
         assert recs[1] is None
         assert batch.call_args.args == (["1", "2"], s2.AUTHOR_FIELDS_STR)
-        assert batch.call_args.kwargs == {"endpoint": "author"}
+        assert batch.call_args.kwargs == {"endpoint": "author", "session": None}
 
     def test_search_authors_requests_exact_path_and_params(self) -> None:
-        payload: MutableJSON = {
+        payload: dict[str, MutablePlainTree] = {
             "total": 0,
             "data": [],
         }
@@ -58,9 +59,10 @@ class TestAuthors:
             "/author/search",
             {"query": "Ada", "fields": s2.AUTHOR_FIELDS_STR},
         )
+        assert get.call_args.kwargs == {"session": None}
 
     def test_search_authors_sorts_unknown_h_index_last(self) -> None:
-        payload: MutableJSON = {
+        payload: dict[str, MutablePlainTree] = {
             "total": 3,
             "data": [
                 {"authorId": "1", "name": "Unknown"},
@@ -73,7 +75,7 @@ class TestAuthors:
         assert [record.name for record in result.records] == ["One", "Zero", "Unknown"]
 
     def test_author_papers_year_filter(self) -> None:
-        entries: list[MutableJSON] = [
+        entries: list[dict[str, MutablePlainTree]] = [
             {"title": "new", "year": 2024},
             {"title": "boundary", "year": 2020},
             {"title": "old", "year": 2000},
@@ -83,9 +85,10 @@ class TestAuthors:
             author_id: str,
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del author_id, limit
+            del author_id, limit, session
             return Page(entries=[e for e in entries if keep(e)], complete=True)
 
         with patch.object(s2, "author_papers", side_effect=fake) as papers:
@@ -100,9 +103,10 @@ class TestAuthors:
             author_id: str,
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del author_id, limit, keep
+            del author_id, limit, session, keep
             return Page(entries=[], complete=False)
 
         with patch.object(s2, "author_papers", side_effect=fake):
@@ -112,7 +116,7 @@ class TestAuthors:
     def test_author_papers_excludes_a_bool_year(self) -> None:
         # ``bool`` subclasses ``int``, so ``isinstance(True, int)`` admitted a
         # JSON ``true`` as a publication year and then compared it as 1.
-        entries: list[MutableJSON] = [
+        entries: list[dict[str, MutablePlainTree]] = [
             {"title": "real", "year": 2024},
             {"title": "bogus", "year": True},
         ]
@@ -121,9 +125,10 @@ class TestAuthors:
             author_id: str,
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del author_id, limit
+            del author_id, limit, session
             return Page(entries=[e for e in entries if keep(e)], complete=True)
 
         with patch.object(s2, "author_papers", side_effect=fake):
@@ -131,15 +136,16 @@ class TestAuthors:
         assert [r.title for r in listing.records] == ["real"]
 
     def test_author_papers_no_filter_keeps_all(self) -> None:
-        entries: list[MutableJSON] = [{"title": "a"}, {"title": "b"}]
+        entries: list[dict[str, MutablePlainTree]] = [{"title": "a"}, {"title": "b"}]
 
         def fake(
             author_id: str,
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del author_id, limit
+            del author_id, limit, session
             # No bounds -> keep predicate returns True for every entry.
             return Page(entries=[e for e in entries if keep(e)], complete=True)
 
@@ -149,7 +155,7 @@ class TestAuthors:
 
     def test_author_papers_year_to_and_undated(self) -> None:
         # year_to upper bound + an undated (non-int year) work excluded.
-        entries: list[MutableJSON] = [
+        entries: list[dict[str, MutablePlainTree]] = [
             {"title": "in", "year": 2018},
             {"title": "boundary", "year": 2020},
             {"title": "toolate", "year": 2024},
@@ -160,9 +166,10 @@ class TestAuthors:
             author_id: str,
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del author_id, limit
+            del author_id, limit, session
             return Page(entries=[e for e in entries if keep(e)], complete=True)
 
         with patch.object(s2, "author_papers", side_effect=fake):
@@ -170,7 +177,59 @@ class TestAuthors:
         assert [r.title for r in listing.records] == ["in", "boundary"]
 
 
+class _SessionFetch:
+    """A ``fetch`` returning one fixed body and recording each call's session."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self.sessions: list[FetchSession | None] = []
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        request: object = None,
+        session: FetchSession | None = None,
+    ) -> bytes:
+        del url, request
+        self.sessions.append(session)
+        return self._body
+
+
+class TestSessionForwarding:
+    """Every author call reuses the caller's session for its fetch."""
+
+    def _sessions(
+        self,
+        body: bytes,
+        call: Callable[[FetchSession], object],
+    ) -> list[bool]:
+        session = FetchSession()
+        fetch = _SessionFetch(body)
+        with patch.object(s2, "fetch", fetch):
+            call(session)
+        return [s is session for s in fetch.sessions]
+
+    def test_search_authors(self) -> None:
+        def call(s: FetchSession) -> object:
+            return search_authors("ada", limit=None, session=s)
+
+        assert self._sessions(b'{"data": []}', call) == [True]
+
+    def test_author_metadata(self) -> None:
+        def call(s: FetchSession) -> object:
+            return author_metadata(["1"], session=s)
+
+        assert self._sessions(b"[]", call) == [True]
+
+    def test_author_papers(self) -> None:
+        def call(s: FetchSession) -> object:
+            return author_papers("1", session=s)
+
+        assert self._sessions(b'{"data": [], "next": null}', call) == [True]
+
+
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

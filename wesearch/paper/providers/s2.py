@@ -1,11 +1,10 @@
 """Semantic Scholar backend for :mod:`wesearch.paper`.
 
 Wraps the S2 Graph API: paper search, metadata (single + batched), the
-reference/citation graph, and author search / metadata / papers. Every request
-is paced through the shared per-source cross-process gate
-(:func:`wesearch.ratelimit.cross_process_limiter`) and retries a 429 with the
-exponential backoff S2 requires, recording the backoff into the shared cooldown
-so concurrent holders of the key wait together rather than each re-hammering.
+reference/citation graph, and author search / metadata / papers. Pacing and
+the shared 429 lock are :func:`wesearch.fetch.fetch`'s, keyed on S2's host
+(:mod:`wesearch.fetch.gate`); a 429 is retried with the backoff S2 asks for
+through fetch's own retry loop.
 
 Sync by design (the whole library is): a coroutine call site lifts these into a
 thread with ``asyncio.to_thread``. Functions return parsed records or raise a
@@ -20,20 +19,21 @@ import functools
 import json
 import os
 
+from treekle import MutablePlainTree, ReadError, from_plain
+
 from wesearch.fetch import (
     ContentParams,
+    FetchSession,
     PolicyParams,
     RequestParams,
     RetryParams,
     Transport,
     fetch,
 )
-from wesearch.lib.custom_json import MutableJSON, ReadError, convert
 from wesearch.paper import paginate as paper_paginate
-from wesearch.paper.custom_types import AuthorRecord, PaperRecord
 from wesearch.paper.errors import BackendError, translate_http_error
 from wesearch.paper.paginate import Cursor, Page
-from wesearch.ratelimit import cross_process_limiter
+from wesearch.paper.types import AuthorRecord, PaperRecord
 from wesearch.types.errors import FetchError
 
 
@@ -59,16 +59,12 @@ __all__ = [
 # them (NOT module state); a caller overrides any knob through the signature.
 # Named here in prose so the rationale lives once:
 #   base="https://api.semanticscholar.org/graph/v1" -- S2 Graph API base URL.
-#   source="s2" -- rate-limit gate key
-#     (see :func:`wesearch.ratelimit.cross_process_limiter`). Every holder of the
-#     S2 budget must pass the same key to share one gate.
 #   timeout_sec=10.0 -- healthy S2 latency is sub-second to a few seconds even
 #     for a 100-item page; 10s clears the slow tail (batch POST, deep
 #     pagination) while still bounding a silent hang when S2 is wedged.
-#   max_retries=2 -- paper lookups are interactive: a hard-throttled key must
-#     surface in seconds, so two retries (backoff 1s then 2s = 3s total) honor
-#     S2's required backoff while staying interactive.
-#   backoff_base_sec=1.0 -- base of the exponential 429 backoff (base*2**attempt).
+#   retries=2 -- paper lookups are interactive: a hard-throttled key must
+#     surface in seconds, so two retries (fetch's exponential backoff, or S2's
+#     own Retry-After) honor S2's required backoff while staying interactive.
 #   page_rows=1000 -- list-endpoint page size (refs/cites/author-papers): large
 #     to gather a given number of matches in the fewest gated calls. S2 caps an
 #     over-large request and signals its depth ceiling with a 400, which the
@@ -76,9 +72,6 @@ __all__ = [
 #   search_page_max=100 -- /paper/search page-size ceiling: S2 rejects a search
 #     limit above 100 with a 400. Distinct from page_rows (list endpoints allow
 #     a far larger page).
-#   interval_sec=1.0 -- minimum seconds between requests. S2's authenticated
-#     tier is one request/second cumulative across every endpoint and holder of
-#     the key.
 
 
 # API field selectors -- fixed contracts, not tunables. Refs/cites endpoints
@@ -116,25 +109,21 @@ def get(
     params: dict[str, str | int],
     *,
     base: str = "https://api.semanticscholar.org/graph/v1",
-    source: str = "s2",
-    interval_sec: float = 1.0,
-    max_retries: int = 2,
-    backoff_base_sec: float = 1.0,
+    retries: int = 2,
     timeout_sec: float = 10.0,
     transport: Transport = "auto",
-) -> MutableJSON:
-    """GET an S2 Graph API path, rate-gated, with key injection and backoff.
+    session: FetchSession | None = None,
+) -> dict[str, MutablePlainTree]:
+    """GET an S2 Graph API path, with key injection and 429 backoff.
 
     Args:
       path: API path relative to ``base`` (e.g. ``/paper/search``).
       params: Query parameters.
       base: S2 Graph API base URL.
-      source: Rate-limit gate key shared across all S2 callers.
-      interval_sec: Minimum seconds between gated requests.
-      max_retries: 429 retry budget before surfacing the throttle.
-      backoff_base_sec: Base of the exponential 429 backoff (``base*2**attempt``).
+      retries: 429 retry budget before surfacing the throttle.
       timeout_sec: Per-request HTTP timeout.
       transport: Retrieval transport forwarded to the HTTP layer.
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       data: Parsed JSON object.
@@ -143,19 +132,14 @@ def get(
       PaperError: On 404 / exhausted-429 / other HTTP failure or bad JSON.
 
     """
-    raw = _attempt(
-        lambda: fetch(
-            url=f"{base}{path}",
-            request=RequestParams(
-                content=ContentParams(params=params, headers=_headers()),
-                retry=RetryParams(timeout_sec=timeout_sec),
-                policy=PolicyParams(transport=transport),
-            ),
-        )[0],
-        source=source,
-        interval_sec=interval_sec,
-        max_retries=max_retries,
-        backoff_base_sec=backoff_base_sec,
+    raw = _send(
+        f"{base}{path}",
+        RequestParams(
+            content=ContentParams(params=params, headers=_headers()),
+            retry=RetryParams(retries=retries, timeout_sec=timeout_sec),
+            policy=PolicyParams(transport=transport),
+        ),
+        session=session,
     )
     parsed = _loads(raw, path)
     if isinstance(parsed, list):
@@ -169,13 +153,11 @@ def batch(
     *,
     endpoint: Literal["paper", "author"] = "paper",
     base: str = "https://api.semanticscholar.org/graph/v1",
-    source: str = "s2",
-    interval_sec: float = 1.0,
-    max_retries: int = 2,
-    backoff_base_sec: float = 1.0,
+    retries: int = 2,
     timeout_sec: float = 10.0,
     transport: Transport = "auto",
-) -> list[MutableJSON | None]:
+    session: FetchSession | None = None,
+) -> list[dict[str, MutablePlainTree] | None]:
     """Fetch metadata for many ids in one batched ``POST /{endpoint}/batch``.
 
     A single gated call returns every requested record, far cheaper than one
@@ -190,12 +172,10 @@ def batch(
       fields: Comma-separated S2 field selector.
       endpoint: Which batch endpoint to hit.
       base: S2 Graph API base URL.
-      source: Rate-limit gate key shared across all S2 callers.
-      interval_sec: Minimum seconds between gated requests.
-      max_retries: 429 retry budget before surfacing the throttle.
-      backoff_base_sec: Base of the exponential 429 backoff (``base*2**attempt``).
+      retries: 429 retry budget before surfacing the throttle.
       timeout_sec: Per-request HTTP timeout.
       transport: Retrieval transport forwarded to the HTTP layer.
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       records: One entry per input id, in order; ``None`` for unresolved ids.
@@ -206,29 +186,27 @@ def batch(
     """
     if not ids:
         return []
-    raw = _attempt(
-        lambda: fetch(
-            url=f"{base}/{endpoint}/batch",
-            request=RequestParams(
-                content=ContentParams(
-                    method="POST",
-                    params={"fields": fields},
-                    json={"ids": ids},
-                    headers=_headers(),
-                ),
-                retry=RetryParams(timeout_sec=timeout_sec),
-                policy=PolicyParams(transport=transport),
+    raw = _send(
+        f"{base}/{endpoint}/batch",
+        RequestParams(
+            content=ContentParams(
+                method="POST",
+                params={"fields": fields},
+                json={"ids": ids},
+                headers=_headers(),
             ),
-        )[0],
-        source=source,
-        interval_sec=interval_sec,
-        max_retries=max_retries,
-        backoff_base_sec=backoff_base_sec,
+            retry=RetryParams(retries=retries, timeout_sec=timeout_sec),
+            policy=PolicyParams(transport=transport),
+        ),
+        session=session,
     )
     result = _loads(raw, f"/{endpoint}/batch")
     if not isinstance(result, list):
         raise BackendError(f"Semantic Scholar /{endpoint}/batch returned a non-array.")
-    return [cast(MutableJSON, p) if isinstance(p, dict) else None for p in result]
+    return [
+        cast(dict[str, MutablePlainTree], p) if isinstance(p, dict) else None
+        for p in result
+    ]
 
 
 def paginate(
@@ -236,9 +214,10 @@ def paginate(
     params: dict[str, str | int],
     *,
     limit: int | None,
-    keep: Callable[[MutableJSON], bool] = lambda _e: True,
+    keep: Callable[[dict[str, MutablePlainTree]], bool] = lambda _e: True,
     page_rows: int = 1000,
     transport: Transport = "auto",
+    session: FetchSession | None = None,
 ) -> Page:
     """Walk an S2 ``offset``/``next`` list endpoint via the shared cursor walker.
 
@@ -251,6 +230,7 @@ def paginate(
       page_rows: List-endpoint page size; large to gather matches in the fewest
         gated calls (S2 signals its depth ceiling with a 400).
       transport: Retrieval transport forwarded to the HTTP layer.
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       page: A :class:`Page` (entries + completeness).
@@ -266,6 +246,7 @@ def paginate(
         keep=keep,
         page_size=page_rows,
         transport=transport,
+        session=session,
     )
 
 
@@ -275,6 +256,7 @@ def search_paginate(
     limit: int | None,
     search_page_max: int = 100,
     transport: Transport = "auto",
+    session: FetchSession | None = None,
 ) -> tuple[Page, int]:
     """Walk ``/paper/search`` (offset/total paging, capped at the search ceiling).
 
@@ -289,6 +271,7 @@ def search_paginate(
       search_page_max: ``/paper/search`` page-size ceiling (S2 rejects a search
         limit above 100 with a 400).
       transport: Retrieval transport forwarded to the HTTP layer.
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       page: A :class:`Page` (hits + completeness).
@@ -297,16 +280,24 @@ def search_paginate(
     """
     total = 0
 
-    def fetch_page(offset: int, size: int) -> MutableJSON:
+    def fetch_page(offset: int, size: int) -> dict[str, MutablePlainTree]:
         nonlocal total
         page_params = {**params, "offset": offset, "limit": size}
-        body = get("/paper/search", page_params, transport=transport)
+        body = get(
+            "/paper/search",
+            page_params,
+            transport=transport,
+            session=session,
+        )
         total = _count(body.get("total"))
         return body
 
     cursor = Cursor(
         fetch=fetch_page,
-        rows=lambda body: cast(list[MutableJSON], body.get("data") or []),
+        rows=lambda body: cast(
+            list[dict[str, MutablePlainTree]],
+            body.get("data") or [],
+        ),
         advance=_search_offset_advance,
         page_size_max=search_page_max,
         is_depth_ceiling=lambda e: e.status == 400,
@@ -319,7 +310,7 @@ def search_paginate(
 
 
 def paper_record_from(
-    data: MutableJSON,
+    data: dict[str, MutablePlainTree],
     *,
     sources: tuple[str, ...] = ("s2",),
     is_influential: bool | None = None,
@@ -342,25 +333,23 @@ def paper_record_from(
     authors_raw = _objects(data.get("authors"))
     authors = tuple(str(a["name"]) for a in authors_raw if a.get("name"))
     oa = _object(data.get("openAccessPdf"))
-    doi = ids.get("DOI")
-    arxiv = ids.get("ArXiv")
     return PaperRecord(
         title=str(data.get("title") or ""),
         authors=authors,
         year=cast(int | None, data.get("year")),
-        venue=(str(data["venue"]) if data.get("venue") else None),
-        doi=(str(doi) if doi else None),
-        arxiv_id=(str(arxiv) if arxiv else None),
-        abstract=(str(data["abstract"]) if data.get("abstract") else None),
+        venue=_text(data.get("venue")),
+        doi=_text(ids.get("DOI")),
+        arxiv_id=_text(ids.get("ArXiv")),
+        abstract=_text(data.get("abstract")),
         citation_count=cast(int | None, data.get("citationCount")),
         reference_count=cast(int | None, data.get("referenceCount")),
-        open_access_pdf=(str(oa["url"]) if oa.get("url") else None),
+        open_access_pdf=_text(oa.get("url")),
         sources=sources,
         is_influential=is_influential,
     )
 
 
-def author_record_from(data: MutableJSON) -> AuthorRecord:
+def author_record_from(data: dict[str, MutablePlainTree]) -> AuthorRecord:
     """Convert an S2 author dict into an :class:`AuthorRecord`.
 
     Args:
@@ -388,16 +377,13 @@ def author_record_from(data: MutableJSON) -> AuthorRecord:
             if isinstance(name, str) and name.strip():
                 affiliations.append(name.strip())
 
-    homepage_raw = data.get("homepage")
-    homepage = (
-        str(homepage_raw) if isinstance(homepage_raw, str) and homepage_raw else None
-    )
+    homepage = data.get("homepage")
     return AuthorRecord(
         author_id=author_id,
         name=str(data.get("name") or "(unknown)"),
         aliases=aliases,
         affiliations=tuple(affiliations),
-        homepage=homepage,
+        homepage=homepage if isinstance(homepage, str) else "",
         h_index=cast(int | None, data.get("hIndex")),
         citation_count=cast(int | None, data.get("citationCount")),
         paper_count=cast(int | None, data.get("paperCount")),
@@ -408,8 +394,9 @@ def author_papers(
     author_id: str,
     *,
     limit: int | None,
-    keep: Callable[[MutableJSON], bool] = lambda _e: True,
+    keep: Callable[[dict[str, MutablePlainTree]], bool] = lambda _e: True,
     transport: Transport = "auto",
+    session: FetchSession | None = None,
 ) -> Page:
     """Fetch an author's publications, walking the cursor for filtered matches.
 
@@ -418,6 +405,7 @@ def author_papers(
       limit: Maximum kept records to return, or ``None`` for one page.
       keep: Predicate selecting which paper entries to retain.
       transport: Retrieval transport forwarded to the HTTP layer.
+      session: Connections to reuse; ``None`` uses the process's shared session.
 
     Returns:
       result: Paginated author's papers, filtered by keep() predicate.
@@ -429,10 +417,11 @@ def author_papers(
         limit=limit,
         keep=keep,
         transport=transport,
+        session=session,
     )
 
 
-def search_total(data: MutableJSON) -> int:
+def search_total(data: dict[str, MutablePlainTree]) -> int:
     """Extract the ``total`` field from an S2 search response.
 
     Args:
@@ -445,51 +434,47 @@ def search_total(data: MutableJSON) -> int:
     return _count(data.get("total"))
 
 
+def _send(
+    url: str,
+    request: RequestParams,
+    *,
+    session: FetchSession | None = None,
+) -> bytes:
+    """Fetch one S2 request; map a transport failure to a :class:`PaperError`."""
+    try:
+        return fetch(url, request=request, session=session)
+    except FetchError as e:
+        raise translate_http_error(
+            e,
+            backend="Semantic Scholar",
+            rate_limit_message=(
+                "Semantic Scholar rate limit hit (shared 1 req/sec gate). Set "
+                "SEMANTIC_SCHOLAR_API_KEY for a higher tier or retry shortly."
+            ),
+        ) from e
+    except (TimeoutError, OSError) as e:
+        raise BackendError(
+            f"Semantic Scholar request failed (timeout or connection error): {e}",
+        ) from e
+
+
 def _headers() -> dict[str, str]:
     """Build S2 request headers, injecting ``x-api-key`` when present in env."""
     headers: dict[str, str] = {"Accept": "application/json"}
-    key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+    key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
     if key:
         headers["x-api-key"] = key
     return headers
 
 
-def _attempt(
-    do_fetch: Callable[[], bytes],
-    *,
-    source: str = "s2",
-    interval_sec: float = 1.0,
-    max_retries: int = 2,
-    backoff_base_sec: float = 1.0,
-) -> bytes:
-    """Run one gated S2 request with 429 backoff; return bytes or raise."""
-    limiter = cross_process_limiter(source, per_seconds=interval_sec)
-    for attempt in range(max_retries + 1):
-        limiter.acquire()
-        try:
-            return do_fetch()
-        except FetchError as e:
-            if e.status == 429 and attempt < max_retries:
-                # Record the backoff into the shared cooldown so the next
-                # iteration's gate wait IS the backoff and concurrent requesters
-                # share one window rather than each rediscovering the throttle.
-                limiter.trigger_cooldown(backoff_base_sec * 2**attempt)
-                continue
-            raise translate_http_error(
-                e,
-                backend="Semantic Scholar",
-                rate_limit_message=(
-                    "Semantic Scholar rate limit hit (shared 1 req/sec gate). Set "
-                    "SEMANTIC_SCHOLAR_API_KEY for a higher tier or retry shortly."
-                ),
-            ) from e
-        except (TimeoutError, OSError) as e:
-            raise BackendError(
-                f"Semantic Scholar request failed (timeout or connection error): {e}",
-            ) from e
-    raise AssertionError(  # pragma: no cover -- loop either returns or raises
-        "_attempt retry loop exited without returning",
-    )
+def _loads(raw: bytes, what: str) -> dict[str, MutablePlainTree] | list[object]:
+    """Parse S2 JSON bytes, mapping a decode failure to :class:`BackendError`."""
+    try:
+        return cast(dict[str, MutablePlainTree] | list[object], json.loads(raw))
+    except json.JSONDecodeError as e:
+        raise BackendError(
+            f"Semantic Scholar returned invalid JSON for {what}: {e}",
+        ) from e
 
 
 def _paginate(
@@ -497,9 +482,10 @@ def _paginate(
     params: dict[str, str | int],
     *,
     limit: int | None,
-    keep: Callable[[MutableJSON], bool],
+    keep: Callable[[dict[str, MutablePlainTree]], bool],
     page_size: int,
     transport: Transport,
+    session: FetchSession | None = None,
 ) -> Page:
     """Build an S2 offset/next :class:`Cursor` and delegate to the walker."""
     cursor = Cursor(
@@ -508,8 +494,12 @@ def _paginate(
             path,
             params,
             transport=transport,
+            session=session,
         ),
-        rows=lambda body: cast(list[MutableJSON], body.get("data") or []),
+        rows=lambda body: cast(
+            list[dict[str, MutablePlainTree]],
+            body.get("data") or [],
+        ),
         advance=_next_offset_advance,
         page_size_max=page_size,
         # S2 answers a too-deep page with 400 ``offset + limit < 10000`` -- the
@@ -526,13 +516,18 @@ def _fetch_offset_page(
     size: int,
     *,
     transport: Transport,
-) -> MutableJSON:
+    session: FetchSession | None = None,
+) -> dict[str, MutablePlainTree]:
     """GET one offset/limit page of an S2 list endpoint."""
     page_params = {**params, "offset": offset, "limit": size}
-    return get(path, page_params, transport=transport)
+    return get(path, page_params, transport=transport, session=session)
 
 
-def _next_offset_advance(body: MutableJSON, offset: int, size: int) -> int | None:
+def _next_offset_advance(
+    body: dict[str, MutablePlainTree],
+    offset: int,
+    size: int,
+) -> int | None:
     """Next offset from an S2 list body; None when ``next`` is gone or no rows."""
     del offset, size
     nxt = body.get("next")
@@ -540,7 +535,27 @@ def _next_offset_advance(body: MutableJSON, offset: int, size: int) -> int | Non
     return nxt if isinstance(nxt, int) and rows else None
 
 
-def _search_offset_advance(body: MutableJSON, offset: int, size: int) -> int | None:
+def _array(value: object) -> list[object]:
+    """Return ``value`` when it is a JSON array, else ``[]``."""
+    try:
+        return from_plain(value, list[object])
+    except ReadError:
+        return []
+
+
+def _count(value: object) -> int:
+    """Return an integer count, parsing ``"3"`` and ``3.0``, else 0."""
+    try:
+        return from_plain(value, int, strict=False, default=0)
+    except ReadError:
+        return 0
+
+
+def _search_offset_advance(
+    body: dict[str, MutablePlainTree],
+    offset: int,
+    size: int,
+) -> int | None:
     """Return the next ``/paper/search`` offset; None at ``total`` or an empty page."""
     del size
     rows = _array(body.get("data"))
@@ -548,30 +563,12 @@ def _search_offset_advance(body: MutableJSON, offset: int, size: int) -> int | N
     return nxt if rows and nxt < _count(body.get("total")) else None
 
 
-def _loads(raw: bytes, what: str) -> MutableJSON | list[object]:
-    """Parse S2 JSON bytes, mapping a decode failure to :class:`BackendError`."""
-    try:
-        return cast(MutableJSON | list[object], json.loads(raw))
-    except json.JSONDecodeError as e:
-        raise BackendError(
-            f"Semantic Scholar returned invalid JSON for {what}: {e}",
-        ) from e
-
-
 def _object(value: object) -> dict[str, object]:
     """Return ``value`` when it is a JSON object, else ``{}``."""
     try:
-        return convert(value, dict[str, object])
+        return from_plain(value, dict[str, object])
     except ReadError:
         return {}
-
-
-def _array(value: object) -> list[object]:
-    """Return ``value`` when it is a JSON array, else ``[]``."""
-    try:
-        return convert(value, list[object])
-    except ReadError:
-        return []
 
 
 def _objects(value: object) -> list[dict[str, object]]:
@@ -579,9 +576,6 @@ def _objects(value: object) -> list[dict[str, object]]:
     return [obj for item in _array(value) if (obj := _object(item))]
 
 
-def _count(value: object) -> int:
-    """Return an integer count, parsing ``"3"`` and ``3.0``, else 0."""
-    try:
-        return convert(value, int, strict=False, default=0)
-    except ReadError:
-        return 0
+def _text(value: object) -> str:
+    """Return a JSON value as text, ``""`` for a falsy one (null, ``""``, ``0``)."""
+    return str(value) if value else ""

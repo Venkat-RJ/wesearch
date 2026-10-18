@@ -14,10 +14,10 @@ from typing import Final
 import ast
 import functools
 
+from treekle import from_plain
+
 import pytest
 import yaml
-
-from wesearch.lib.custom_json import convert
 
 
 _THIS: Final = Path(__file__).resolve()
@@ -69,19 +69,18 @@ def test_the_conftest_imports_at_module_scope() -> None:
 
 
 def test_the_package_conftest_binds_browser_teardown() -> None:
-    """An autouse module fixture must close the pool, not a per-test ``finally``.
+    """An autouse module fixture must stop launched Chromes, not a per-test ``finally``.
 
     A ``finally`` protects the one test that writes it. Binding teardown at the
     package conftest is what stops a NEW test file reintroducing the leak by
     omission.
 
-    Parsed, never grepped. The conftest's own docstring names ``autouse``, the
-    scope, and ``shutdown_browsers`` while explaining them, so every substring
-    this asserts is present in prose alone: gutting the fixture body to a bare
-    ``yield`` left three substring checks passing against a fixture that reaps
-    nothing.
+    Parsed, never grepped. The conftest's own docstring names the scope and
+    what it stops while explaining them, so every substring this asserts is
+    present in prose alone: gutting the fixture body to a bare ``yield`` left
+    substring checks passing against a fixture that reaps nothing.
     """
-    fixture = _fixture_def(_CWD / "conftest.py", name="close_pooled_browsers")
+    fixture = _fixture_def(_CWD / "conftest.py", name="stop_launched_chromes")
 
     decorator = next(
         node
@@ -102,9 +101,10 @@ def test_the_package_conftest_binds_browser_teardown() -> None:
         "browser teardown must be autouse, so it covers every test file "
         "without each one opting in"
     )
-    assert _calls(fixture, "shutdown_browsers"), (
-        "wesearch/conftest.py names shutdown_browsers but never calls it; a "
-        "test file that launches Chrome now leaks for the whole run"
+    assert _stops_launched(fixture), (
+        "wesearch/conftest.py never calls BrowserPool().shutdown(stop_launched=True); "
+        "the shared Chrome is detached and outlives a disconnect, so every "
+        "isolated test profile leaves one running"
     )
 
 
@@ -122,19 +122,27 @@ def _decorator_name(call: ast.Call) -> str:
     return ast.unparse(call.func)
 
 
-def _calls(tree: ast.AST, name: str) -> bool:
-    """Whether ``tree`` contains a call to the bare function ``name``."""
+def _stops_launched(tree: ast.AST) -> bool:
+    """Whether ``tree`` calls ``BrowserPool().shutdown(stop_launched=True)``."""
     return any(
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == name
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "shutdown"
+        and isinstance(node.func.value, ast.Call)
+        and ast.unparse(node.func.value.func) == "BrowserPool"
+        and any(
+            keyword.arg == "stop_launched"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
         for node in ast.walk(tree)
     )
 
 
 @pytest.mark.compute_large_fixture
 def test_no_test_file_relies_on_its_own_browser_teardown() -> None:
-    """With the fixture in place, a per-file ``shutdown_browsers`` is a trap.
+    """With the fixture in place, a per-file Chrome teardown is a trap.
 
     It reads as sufficient and is not: the next file to launch a browser and
     omit the call leaks exactly as before. One owner, so there is a single
@@ -143,18 +151,18 @@ def test_no_test_file_relies_on_its_own_browser_teardown() -> None:
     # Parsed, not grepped: this file and a comment elsewhere both mention the
     # call by name, and a substring search reports those as violations. Only a
     # real Call node is one.
+    # ``BrowserPool``'s own unit tests call the method as their subject, not as
+    # teardown.
+    owner = _CWD / "fetch" / "transport" / "zendriver_test.py"
     offenders = [
         str(path.relative_to(_CWD))
         for path in sorted(_CWD.rglob("*_test.py"))
-        if path != _THIS
-        and _calls(
-            ast.parse(path.read_text(encoding="utf-8"), str(path)),
-            "shutdown_browsers",
-        )
+        if path not in {_THIS, owner}
+        and _stops_launched(ast.parse(path.read_text(encoding="utf-8"), str(path)))
     ]
 
     assert offenders == [], (
-        f"these files close browsers themselves; the autouse fixture in "
+        f"these files stop launched Chromes themselves; the autouse fixture in "
         f"conftest.py owns that now: {offenders}"
     )
 
@@ -183,18 +191,18 @@ def test_a_file_marking_an_xdist_group_keeps_the_scheduler_that_honors_it() -> N
     ]
     assert marked, "no test file marks an xdist group; this guard is vacuous"
 
-    config = convert(
+    config = from_plain(
         yaml.safe_load(config_path.read_text(encoding="utf-8")),
         dict[str, object],
     )
     integration = [
         hook
-        for repo in convert(config.get("repos"), list[dict[str, object]], default=[])
-        for hook in convert(repo.get("hooks"), list[dict[str, object]], default=[])
-        if convert(hook.get("id"), str, default="") == "pytest-integration-global"
+        for repo in from_plain(config.get("repos"), list[dict[str, object]], default=[])
+        for hook in from_plain(repo.get("hooks"), list[dict[str, object]], default=[])
+        if from_plain(hook.get("id"), str, default="") == "pytest-integration-global"
     ]
     assert integration, "no pytest-integration-global hook"
-    script = "\n".join(convert(integration[0].get("args"), list[str], default=[]))
+    script = "\n".join(from_plain(integration[0].get("args"), list[str], default=[]))
 
     assert "--dist=loadgroup" in script, (
         f"{marked} mark an xdist group, but the integration hook no longer "
@@ -203,6 +211,6 @@ def test_a_file_marking_an_xdist_group_keeps_the_scheduler_that_honors_it() -> N
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

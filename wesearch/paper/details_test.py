@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from wesearch.paper.custom_types import PaperRecord
+from wesearch.fetch import FetchSession
 from wesearch.paper.details import (
     citations,
     metadata,
@@ -20,17 +20,18 @@ from wesearch.paper.providers import (
     openalex,
     s2,
 )
+from wesearch.paper.types import PaperRecord
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from wesearch.lib.custom_json import MutableJSON
+    from treekle import MutablePlainTree
 
 
 class TestCitations:
     def test_year_filter_keeps_recent(self) -> None:
-        entries: list[MutableJSON] = [
+        entries: list[dict[str, MutablePlainTree]] = [
             {"isInfluential": True, "citingPaper": {"title": "new", "year": 2024}},
             {"isInfluential": False, "citingPaper": {"title": "old", "year": 2010}},
         ]
@@ -40,9 +41,10 @@ class TestCitations:
             params: dict[str, str | int],
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del path, params, limit
+            del path, params, limit, session
             return Page(entries=[e for e in entries if keep(e)], complete=True)
 
         with patch.object(s2, "paginate", side_effect=fake):
@@ -50,7 +52,7 @@ class TestCitations:
         assert [r.title for r in listing.records] == ["new"]
 
     def test_year_filter_includes_the_boundary_year(self) -> None:
-        entry: MutableJSON = {
+        entry: dict[str, MutablePlainTree] = {
             "isInfluential": True,
             "citingPaper": {"title": "boundary", "year": 2020},
         }
@@ -66,7 +68,7 @@ class TestCitations:
     def test_year_filter_excludes_a_bool_year(self) -> None:
         # ``isinstance(True, int)`` is true, so a JSON ``true`` year passed the
         # filter and was compared as the value 1.
-        entries: list[MutableJSON] = [
+        entries: list[dict[str, MutablePlainTree]] = [
             {"isInfluential": True, "citingPaper": {"title": "real", "year": 2024}},
             {"isInfluential": True, "citingPaper": {"title": "bogus", "year": True}},
         ]
@@ -76,9 +78,10 @@ class TestCitations:
             params: dict[str, str | int],
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del path, params, limit
+            del path, params, limit, session
             return Page(entries=[e for e in entries if keep(e)], complete=True)
 
         with patch.object(s2, "paginate", side_effect=fake):
@@ -86,7 +89,7 @@ class TestCitations:
         assert [r.title for r in listing.records] == ["real"]
 
     def test_influential_only_filters(self) -> None:
-        entries: list[MutableJSON] = [
+        entries: list[dict[str, MutablePlainTree]] = [
             {"isInfluential": True, "citingPaper": {"title": "keep"}},
             {"isInfluential": False, "citingPaper": {"title": "drop"}},
         ]
@@ -96,9 +99,10 @@ class TestCitations:
             params: dict[str, str | int],
             *,
             limit: int | None,
-            keep: Callable[[MutableJSON], bool],
+            keep: Callable[[dict[str, MutablePlainTree]], bool],
+            session: FetchSession | None = None,
         ) -> Page:
-            del path, params, limit
+            del path, params, limit, session
             return Page(entries=[e for e in entries if keep(e)], complete=False)
 
         with patch.object(s2, "paginate", side_effect=fake):
@@ -143,19 +147,26 @@ class TestCitations:
             citations("doi", "10.1/x", limit=7, source="openalex", year_from=2020)
 
         assert citations_call.call_args.args == ("doi", "10.1/x")
-        assert citations_call.call_args.kwargs == {"limit": 7, "year_from": 2020}
+        assert citations_call.call_args.kwargs == {
+            "limit": 7,
+            "year_from": 2020,
+            "session": None,
+        }
 
 
 class TestMetadata:
     def test_single(self) -> None:
-        payload: MutableJSON = {"title": "T", "externalIds": {"DOI": "10.1/x"}}
+        payload: dict[str, MutablePlainTree] = {
+            "title": "T",
+            "externalIds": {"DOI": "10.1/x"},
+        }
         with patch.object(s2, "get", return_value=payload) as get:
             rec = metadata("doi", "10.1/x")
         assert rec.title == "T"
         assert get.call_args.args[0] == "/paper/DOI:10.1/x"
 
     def test_single_requests_full_s2_fields(self) -> None:
-        payload: MutableJSON = {"title": "T"}
+        payload: dict[str, MutablePlainTree] = {"title": "T"}
         with patch.object(s2, "get", return_value=payload) as get:
             metadata("arxiv", "2312.00000")
 
@@ -176,7 +187,7 @@ class TestMetadata:
             metadata_batch(["DOI:1", "ARXIV:2"])
 
         assert batch.call_args.args == (["DOI:1", "ARXIV:2"], s2.S2_PAPER_FIELDS_STR)
-        assert batch.call_args.kwargs == {"endpoint": "paper"}
+        assert batch.call_args.kwargs == {"endpoint": "paper", "session": None}
 
 
 class TestReferences:
@@ -200,7 +211,7 @@ class TestReferences:
                 ),
             },
         )
-        assert paginate.call_args.kwargs == {"limit": 7}
+        assert paginate.call_args.kwargs == {"limit": 7, "session": None}
 
     def test_skips_empty_inner_edge(self) -> None:
         # An edge row with no inner paper object is skipped, not mapped to a stub.
@@ -229,7 +240,7 @@ class TestOpenAlexGraphSource:
         assert [r.title for r in listing.records] == ["ref"]
         assert listing.complete
         assert oa_refs.call_args.args == ("doi", "10.1/x")
-        assert oa_refs.call_args.kwargs == {"limit": 7}
+        assert oa_refs.call_args.kwargs == {"limit": 7, "session": None}
 
     def test_citations_dispatches_to_openalex(self) -> None:
         recs = [PaperRecord(title="citer", sources=("openalex",))]
@@ -242,7 +253,11 @@ class TestOpenAlexGraphSource:
         assert [r.title for r in listing.records] == ["citer"]
         assert not listing.complete  # Total 500 > 1 returned.
         assert oa_cites.call_args.args == ("doi", "10.1/x")
-        assert oa_cites.call_args.kwargs == {"limit": 1, "year_from": None}
+        assert oa_cites.call_args.kwargs == {
+            "limit": 1,
+            "year_from": None,
+            "session": None,
+        }
 
     def test_openalex_citations_complete_when_all_returned(self) -> None:
         recs = [PaperRecord(title="c", sources=("openalex",))]
@@ -286,7 +301,82 @@ class TestOpenAlexGraphSource:
             )
 
 
+class _SessionFetch:
+    """A ``fetch`` returning one fixed body and recording each call's session."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self.sessions: list[FetchSession | None] = []
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        request: object = None,
+        session: FetchSession | None = None,
+    ) -> bytes:
+        del url, request
+        self.sessions.append(session)
+        return self._body
+
+
+_S2_PAGE = b'{"data": [], "next": null}'
+_OA_RESOLVE = (
+    b'{"results": [{"id": "W1", "referenced_works": []}], "meta": {"count": 0}}'
+)
+
+
+class TestSessionForwarding:
+    """Every lookup reuses the caller's session for each fetch it makes."""
+
+    def _sessions(self, owner: object, body: bytes, call: _Call) -> list[bool]:
+        session = FetchSession()
+        fetch = _SessionFetch(body)
+        with patch.object(owner, "fetch", fetch):
+            call(session)
+        return [s is session for s in fetch.sessions]
+
+    def test_metadata(self) -> None:
+        def call(s: FetchSession) -> object:
+            return metadata("doi", "10.1/x", session=s)
+
+        assert self._sessions(s2, b"{}", call) == [True]
+
+    def test_metadata_batch(self) -> None:
+        def call(s: FetchSession) -> object:
+            return metadata_batch(["DOI:1"], session=s)
+
+        assert self._sessions(s2, b"[]", call) == [True]
+
+    def test_s2_references(self) -> None:
+        def call(s: FetchSession) -> object:
+            return references("doi", "10.1/x", limit=1, session=s)
+
+        assert self._sessions(s2, _S2_PAGE, call) == [True]
+
+    def test_s2_citations(self) -> None:
+        def call(s: FetchSession) -> object:
+            return citations("doi", "10.1/x", limit=1, session=s)
+
+        assert self._sessions(s2, _S2_PAGE, call) == [True]
+
+    def test_openalex_references(self) -> None:
+        def call(s: FetchSession) -> object:
+            return references("doi", "10.1/x", limit=1, source="openalex", session=s)
+
+        assert self._sessions(openalex, _OA_RESOLVE, call) == [True]
+
+    def test_openalex_citations(self) -> None:
+        def call(s: FetchSession) -> object:
+            return citations("doi", "10.1/x", limit=1, source="openalex", session=s)
+
+        assert self._sessions(openalex, _OA_RESOLVE, call) == [True, True]
+
+
+type _Call = Callable[[FetchSession], object]
+
+
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

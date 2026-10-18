@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import shlex
 
 
 __all__ = [
     "BotDetectionError",
     "CloudflareChallengeError",
+    "CooldownError",
     "FetchError",
     "GoogleJavascriptRequiredError",
     "GoogleSorryError",
@@ -45,10 +48,20 @@ class FetchError(Exception):
 
 
 class BotDetectionError(FetchError):
-    """A site served an automated-access challenge instead of content."""
+    """A site served an automated-access challenge instead of content.
+
+    Attributes:
+      browser_clears: Whether a real browser engine gets past this block where
+        curl cannot, so the domain should route to the browser from now on.
+        False for a block that is about the IP or needs a human; routing those
+        to the browser only moves the same failure onto the slower transport.
+
+    """
+
+    browser_clears: ClassVar[bool] = False
 
     guidance = (
-        "The site served an automated-access block. RetryParams later or from a "
+        "The site served an automated-access block. Retry later or from a "
         "different IP; a full browser session may be required."
     )
 
@@ -72,18 +85,10 @@ class BotDetectionError(FetchError):
 
     @classmethod
     def recovery(cls, url: str) -> str:
-        """Return the interactive-browser recovery instruction for ``url``.
-
-        Args:
-          url: Url.
-
-        Returns:
-          result: The str.
-
-        """
+        """Return how to clear the block on ``url`` by hand."""
         return (
-            f"Run `fetch-zendriver {shlex.quote(url)}`, solve the challenge, "
-            "then close Chrome to clear this domain's cooldown."
+            f"Run `zendriver {shlex.quote(url)}` and solve the challenge; "
+            "the site unlocks once its page loads."
         )
 
     @classmethod
@@ -113,6 +118,8 @@ class PuzzleChallengeError(BotDetectionError):
 class CloudflareChallengeError(BotDetectionError):
     """Cloudflare served a managed challenge."""
 
+    browser_clears = True
+
     guidance = (
         "Cloudflare served a managed challenge (Turnstile / 'Just a moment'). "
         "It clears by running the page JS in a real browser engine or from a "
@@ -130,8 +137,19 @@ class GoogleSorryError(BotDetectionError):
     )
 
 
+class CooldownError(BotDetectionError):
+    """A recent block on this IP holds the site shut; no request was sent."""
+
+    guidance = (
+        "A recent block on this IP holds the site shut while it recovers. Retry "
+        "after the cooldown, or clear it by loading the page in a real browser."
+    )
+
+
 class GoogleJavascriptRequiredError(BotDetectionError):
     """Google Search served its JavaScript-required shell."""
+
+    browser_clears = True
 
     guidance = (
         "Google served its enablejs shell (an HTTP-200 page with no results that "

@@ -35,7 +35,9 @@ import pytest
 
 from wesearch.fetch.transport.zendriver import BrowserUnavailableError
 from wesearch.lib.userdirs import state_dir
-from wesearch.search.custom_types import (
+from wesearch.search.duckduckgo import duckduckgo
+from wesearch.search.searxng import searxng
+from wesearch.search.types import (
     FileResult,
     ImageResult,
     MapResult,
@@ -48,8 +50,6 @@ from wesearch.search.custom_types import (
     TorrentResult,
     VideoResult,
 )
-from wesearch.search.duckduckgo import duckduckgo
-from wesearch.search.searxng import searxng
 from wesearch.types.errors import BotDetectionError, FetchError
 
 
@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 pytestmark = [pytest.mark.xdist_group(name="live_search")]
 
 _searxng_required = pytest.mark.skipif(
-    not os.environ.get("SEARXNG_URL"),
+    not os.environ.get("SEARXNG_URL", ""),
     reason="SEARXNG_URL not set; live SearXNG instance required.",
 )
 
@@ -415,6 +415,6 @@ class TestSearxngCategoriesLive:
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)

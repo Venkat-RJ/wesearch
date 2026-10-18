@@ -35,17 +35,17 @@ in the common case.
 
 ```python
 from wesearch.search.search import search
-from wesearch.fetch import RequestParams, Retry, fetch
+from wesearch.fetch import RequestParams, RetryParams, fetch
 from wesearch.scrape import get_element_content
 
-# Web search (DuckDuckGo by default)
+# Web search: walks DEFAULT_SEARCH_CHAIN; first non-empty answer wins
 hits = search("denoising recursion models", num_results=10)
 for r in hits:
     print(r.title, r.url)
 
 # Fetch + scrape
-body, _session = fetch(
-    "https://example.com", request=RequestParams(retry=Retry(timeout_sec=10))
+body = fetch(
+    "https://example.com", request=RequestParams(retry=RetryParams(timeout_sec=10))
 )
 title = get_element_content(body.decode("utf-8"), "h1")
 
@@ -70,21 +70,17 @@ nothing.
 wesearch/
 ├── types/           the vocabulary every layer shares; imports nothing internal
 │   ├── params.py    RequestParams + Content/Retry/Observe/Policy; Transport,
-│   │                  Extractor, Trust
-│   ├── extractor.py the Extract protocol each extractor satisfies
+│   │                  Extractor
 │   └── errors.py    FetchError, BotDetectionError + subclasses
 ├── fetch/           the sole HTTP egress
-│   ├── fetch.py     fetch(url, request=RequestParams(...)) -> (body, session)
+│   ├── fetch.py     fetch(url, request=RequestParams(...)) -> body
+│   ├── gate.py      host-wide per-site pacing and block recovery
 │   ├── transport/   how bytes are retrieved
 │   │   ├── curl.py      curl-cffi transport (TLS/JA3 browser impersonation)
 │   │   ├── stdlib.py    dependency-free urllib transport
 │   │   ├── zendriver.py opt-in real-Chrome backend for JS-gated pages
 │   │   └── transport_routing.py  per-domain transport selection
-│   ├── extractor/   how a fetched page becomes text
-│   │   ├── html2text.py   every text node as Markdown (the default)
-│   │   ├── trafilatura.py the scored article body only; article-shaped pages
-│   │   ├── raw.py         the source, untouched
-│   │   └── markdownify.py the document's elements as Markdown
+│   ├── html_to_text.py how a fetched page becomes text
 │   ├── providers/   per-site fetch strategies (reddit, google_news, x, ...)
 │   └── challenge.py bot-challenge detection and classification
 ├── search/          web search over pluggable backends
@@ -102,8 +98,7 @@ wesearch/
 │   ├── headers.py   Chrome request headers (incl. x-browser-validation)
 │   └── useragents.py  vendored, refreshable User-Agent pools
 ├── web.py           fetch_web(...): fetch + provider dispatch + extraction
-├── profile.py       cross-process per-(egress_ip, domain) cookie + UA jar
-├── ratelimit.py     cross-process, per-domain rate limiting
+├── profile.py       cross-process per-(egress_ip, domain) cookie jar
 └── scrape.py        get_element_content(html, selector)
 ```
 
@@ -113,12 +108,19 @@ wesearch/
 
 - **curl-cffi** (default): TLS/JA3 browser impersonation, no browser process.
 - **stdlib**: dependency-free `urllib` fallback.
-- **zendriver**: an opt-in headless-Chrome backend for JavaScript-gated pages, used only for
-  domains that require it.
+- **zendriver**: a headless Chrome for JavaScript-gated pages, used only for domains that
+  require it. One Chrome serves every process on the host: the first fetch launches it
+  detached, later fetches attach over DevTools and work in their own tab.
 
-A persistent per-`(egress_ip, domain)` profile (cookies + User-Agent) is loaded and saved
-transparently, and cross-process rate limiting paces requests so concurrent workers stay under
-each site's threshold.
+A persistent per-`(egress_ip, domain)` cookie profile is loaded and saved
+transparently. Every `fetch` is paced host-wide per site and IP (`fetch/gate.py` holds the
+per-site table). A block locks the site briefly; one caller then probes it, a success
+unlocks every caller, and a failure doubles the lock. Run `zendriver` to clear blocks by
+hand: it opens a tab per challenge-locked site, and each site you load there is unlocked. Search results are cached host-wide for an hour, and a domain
+learned to need the browser is re-probed after a week.
+
+Check backend health with `python -m wesearch.tools` (add `--processes 12` to load-test the
+shared browser).
 
 ## API keys & configuration
 
@@ -131,11 +133,12 @@ or unlock a backend, and are all optional unless noted.
 - `OPENALEX_EMAIL` -- optional. Identifies you to OpenAlex's "polite pool" for more headroom than
   anonymous requests.
 - `OPENALEX_API_KEY` -- optional. A higher OpenAlex request budget.
-- `SEARXNG_URL` -- required only to use a `"searxng"` backend (`search(..., backend="searxng")`
-  or `paper.search(..., source="searxng")`); the base URL of a SearXNG instance you control or
-  trust.
+- `BRAVE_API_KEY` -- optional. Enables the Brave Search API, last in the default
+  search chain because it bills per request.
+- `SEARXNG_URL` -- optional. The base URL of a SearXNG instance you control or trust; enables
+  the `"searxng"` backend and the category tabs.
 
-State (the cookie/User-Agent profile jar, cross-process rate-limit lockfiles, the browser
+State (the cookie profile jar, cross-process rate-limit lockfiles, the browser
 transport's persistent Chrome profile) is written under the OS's standard per-user data
 directory -- `XDG_DATA_HOME` (or `~/.local/share`) on Linux, `~/Library/Application Support` on
 macOS, `%LOCALAPPDATA%` on Windows -- namespaced per component (see `wesearch/lib/userdirs.py`).
@@ -198,7 +201,7 @@ default transport escalates to a headless browser when a site bot-blocks the
 header transports). Outputs are
 deliberately compact for model consumption; abstracts are truncated and
 empty fields dropped. The server is synchronous and per-client — state that
-must be shared (rate limits, cookie/UA profiles) is already cross-process
+must be shared (rate limits, cookie profiles) is already cross-process
 safe on disk, so no daemon is needed.
 
 ## See also

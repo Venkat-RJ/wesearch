@@ -3,6 +3,125 @@
 All notable wesearch changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- **Breaking:** the `fetch-zendriver` console script is renamed `zendriver`.
+  Its Chrome profile directory keeps its name, so seated logins carry over.
+- `zendriver` opens a tab for each site a bot challenge has locked, and
+  unlocks each site as soon as you load a page there. Pages loaded by fetches
+  sharing the window never unlock a site.
+- Every `fetch` is paced and recovered by one host-wide gate, keyed by site and
+  egress IP: a block locks the site briefly, then one caller probes it while
+  the rest get `CooldownError`. A success unlocks every caller.
+- **Breaking:** each transport owns its default headers, and a caller's
+  `headers` merge over them: a value replaces the default (`User-Agent`
+  included), and `None` deletes it. `raw_headers=True` now only skips the
+  cookie profile and the implied `Content-Type`. The Google search backend no
+  longer sends an Android user agent.
+- **Breaking:** `fetch_curl`, `fetch_stdlib` and `fetch_zendriver` take one
+  signature, the `Fetch` protocol in `wesearch.fetch.types`, every argument
+  defaulted: `body=b""`, `connect_timeout_sec=10.0`, and do-nothing
+  `on_redirect`/`on_response`. `impersonate` is removed; curl presents
+  curl_cffi's newest Chrome. Cookies go in the `Cookie` header on all three.
+- **Breaking:** `trust="untrusted"|"internal"` is `allow_private_hosts: bool`
+  (default `False`) on `PolicyParams`, the transports, and `pinned_host`.
+  The `Trust` type and `ValidatedHosts` are removed.
+- **Breaking:** `ContentParams.headers` defaults to `{}`; `ObserveParams`
+  callbacks default to a no-op; `RetryParams.connect_timeout_sec` defaults
+  to 10 seconds.
+- `fetch_zendriver` raises on a page status of 400 or more, reports each
+  page's real status to `on_response`, and sends caller headers it used to
+  drop. A timed-out load raises `FetchError` with status 0, as a failed
+  connection does on curl and stdlib.
+- A redirect's `Set-Cookie` is saved to the profile of the site that set it,
+  on every transport. curl and stdlib used to drop cookies set by another
+  site. A cross-origin hop sends the target's stored cookies, through the
+  transports' new `cookies_for_host` argument.
+- The curl transport claims the Chrome version curl_cffi impersonates, and the
+  stdlib transport the newest version in the bundled user-agent pool. Both
+  name the host's OS. No Chrome version is written in the source.
+- A site is routed straight to the browser only after a block a browser can
+  clear (a Cloudflare challenge, Google's JavaScript wall). A CAPTCHA, a
+  Google `/sorry` page, or a cooldown no longer routes it there.
+- **Breaking:** `Profile` holds cookies only; its never-sent `ua` field is gone.
+  A stored profile written with one still loads. `useragents.draw_user_agent`,
+  `impersonate_target` and `kind_for_impersonate` are removed.
+- **Breaking:** `chrome_user_agent`, `chrome_navigation_headers` and
+  `chrome_headers_for_google` require `platform`; `chrome_client_hints`
+  defaults to `"Linux"`.
+- `wesearch.types.params` exports `HttpMethod`, so `fetch` imports without
+  curl_cffi installed.
+- Processes sharing a cookie profile no longer lose each other's cookies, and
+  a failed cookie save logs instead of failing the fetch.
+- A cookie in the caller's `Cookie` header overrides the stored profile's
+  cookie of the same name; `cookies=` overrides both.
+- The stdlib transport's `timeout_sec` bounds the whole request, not each read.
+- An unpaced site's gate file is deleted once the site recovers.
+- The `web_search` tool description states the real backend fallback order.
+- **Breaking:** `fetch` returns the body bytes, not `(body, session)`.
+  `FetchSession` is now a mutable object you pass in, never one returned:
+  `fetch(url, request=..., session=...)`. It holds the open connections, the
+  browser, the egress IP, the cookie store, and service tokens; `None` uses
+  the process's shared session, `wesearch.fetch.session.default_session()`,
+  closed at exit. `close_default_session()` closes it sooner.
+  `fetch_web` and the providers take `session=` too. Accept-CH opt-ins are no
+  longer learned, so curl sends only the basic client hints.
+- **Breaking:** `egress_ip(session, refresh=...)` returns `""`, not `None`,
+  when no address resolves, and does not probe again for `retry_after_sec`
+  (60) unless `refresh`. An egress change closes the curl connections opened
+  on another address or before the first probe; the browser stays up. `on_egress_rotation`, `set_last_egress_ip`,
+  `last_known_egress_ip`, `ProfileStore.shared`, `curl_session`,
+  `close_curl_session(s_except)`, `shutdown_browsers` and
+  `close_launched_browsers` are removed; `FetchSession.close()` closes
+  connections. `open_instance` is `open_window(url, profile_dir=...)`.
+- **Breaking:** the `wesearch.fetch.extractor` package is one function,
+  `wesearch.fetch.html_to_text.html_to_text(page, extractor=..., url=...)`,
+  which raises on an unknown extractor. `wesearch.types.extractor` is removed.
+- **Breaking:** the tool parameter schemas move to `wesearch.mcp`:
+  `wesearch.types.schema` is `wesearch.mcp.schema`, and
+  `wesearch.fetch.custom_types` is `wesearch.mcp.types`, which also holds
+  `SearchParamsSchema` (was in `wesearch.search.search`). Its `HttpMethod` is
+  `FetchMethod`. `wesearch.search.custom_types` and
+  `wesearch.paper.custom_types` are `.types`. `wesearch.fetch.providers.x`
+  keeps only `matches`; fetch X URLs with `fetch_reader_proxy`.
+
+## 0.1.13 - 2026-10-07
+
+### Changed
+
+- **Breaking:** missing text on paper records is `""`, not `None`.
+  `PaperRecord.venue`, `doi`, `arxiv_id`, `abstract` and `open_access_pdf`,
+  and `AuthorRecord.homepage`, are typed `str` and default to `""`. Test
+  them for truthiness rather than `is None`. Numeric fields keep `None`.
+- **Breaking:** `ContentParams.params` and `ContentParams.cookies` default to
+  an empty dict instead of `None`, and `Field.schema_extra` defaults to an
+  empty mapping. Passing `None` is no longer accepted.
+- **Breaking:** the vendored `wesearch.lib.custom_json` is replaced by
+  `wesearch.lib.codec`. `ContentParams.json` and `fetch_web(json_body=...)`
+  take a `wesearch.lib.codec.PlainTree` (was `custom_json.JSONValue`); plain
+  JSON values are unaffected.
+- Provider responses (Semantic Scholar, OpenAlex, SearXNG, Reddit tokens,
+  stored browser profiles) are parsed with typed reads. A malformed field is
+  dropped or defaulted rather than aborting the result; a stored profile
+  missing its user agent or creation time is ignored and re-created.
+- Development: the bundled typeshed patch, pre-commit configuration and pytest
+  options are updated, and a worker-count helper is vendored as
+  `wesearch.lib.worker_count`. The supported Python versions (3.12+) are
+  unchanged.
+
+### Removed
+
+- The `msgspec` dependency.
+
+### Fixed
+
+- MCP tool descriptions are dedented consistently, so a tool's published
+  description no longer depends on the Python version's docstring handling.
+- `--help` on the bundled scripts works when module docstrings are stripped
+  (`python -OO`).
+
 ## 0.1.12 - 2026-10-03
 
 ### Added

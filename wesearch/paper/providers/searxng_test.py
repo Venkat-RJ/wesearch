@@ -7,9 +7,10 @@ from unittest.mock import patch
 
 import pytest
 
+from wesearch.fetch import FetchSession
 from wesearch.paper.errors import BackendError
 from wesearch.paper.providers import searxng
-from wesearch.search.custom_types import PaperResult, SearchError
+from wesearch.search.types import PaperResult, SearchError
 
 
 def _result(
@@ -73,6 +74,7 @@ class TestSearch:
             "num_results": 20,
             "categories": "science",
             "transport": "auto",
+            "session": None,
         }
 
     def test_default_fetch_when_limit_none(self) -> None:
@@ -175,6 +177,20 @@ class TestSearch:
             )
 
 
+def test_search_forwards_the_session_to_searxng() -> None:
+    session = FetchSession()
+    with patch(_TARGET, return_value=[]) as mock:
+        searxng.search(
+            "q",
+            limit=None,
+            year_from=None,
+            year_to=None,
+            open_access_only=False,
+            session=session,
+        )
+    assert mock.call_args.kwargs["session"] is session
+
+
 class TestToRecord:
     def test_arxiv_id_from_url(self) -> None:
         rec = searxng._to_record(_result(url="https://arxiv.org/abs/1706.03762"))
@@ -182,7 +198,7 @@ class TestToRecord:
 
     def test_arxiv_id_none_for_non_arxiv_url(self) -> None:
         rec = searxng._to_record(_result(url="https://example.com/paper"))
-        assert rec.arxiv_id is None
+        assert rec.arxiv_id == ""
 
     def test_doi_kept_when_normalizes(self) -> None:
         rec = searxng._to_record(_result(doi="10.1234/x"))
@@ -190,7 +206,7 @@ class TestToRecord:
 
     def test_doi_dropped_when_garbage(self) -> None:
         rec = searxng._to_record(_result(doi="garbage"))
-        assert rec.doi is None
+        assert rec.doi == ""
 
     def test_year_from_published(self) -> None:
         rec = searxng._to_record(_result(published=datetime(2019, 6, 1)))  # noqa: DTZ001 -- The fixture intentionally uses a naive datetime.
@@ -219,8 +235,8 @@ class TestToRecord:
     def test_empty_fields_become_none(self) -> None:
         rec = searxng._to_record(_result(title="", journal="", snippet=""))
         assert rec.title == ""
-        assert rec.venue is None
-        assert rec.abstract is None
+        assert rec.venue == ""
+        assert rec.abstract == ""
 
 
 class TestYearInRange:
@@ -264,6 +280,7 @@ class TestExactInternals:
             num_results=3,
             categories="science",
             transport="curl",
+            session=None,
         )
 
     def test_year_lower_only_filter_is_applied(self) -> None:
@@ -354,6 +371,6 @@ class TestExactInternals:
 
 
 if __name__ == "__main__":
-    from wesearch.lib.testing.main import test_main
+    from wesearch.lib.testing.runner import test_main
 
     test_main(__file__)
